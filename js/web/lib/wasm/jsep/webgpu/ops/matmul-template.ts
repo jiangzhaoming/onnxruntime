@@ -1052,7 +1052,7 @@ ${
             tensor_slice_factor > 1 ? `
 // Shared memory for adding up tensor sliced results
 var<workgroup> tensor_slice_acc: array<array<array<ComputeBlockOutputType, compute_blocks_per_workgroup_N>, compute_blocks_per_workgroup_M>, ${
-                                          Math.ceil(tensor_slice_factor / 2)}>
+                                          Math.ceil(tensor_slice_factor / 2)}>;
 ` :
                                       ''}
 
@@ -1150,38 +1150,37 @@ fn main(
     ${
             tensor_slice_factor > 1 ? `
     // Add up tensor slice results if necessary
-    if (tensor_slice_group >= ${Math.ceil(tensor_slice_factor / 2)}) {
+    ${(() => {
+              let code = '';
+              for (let remaining_slices = tensor_slice_factor; remaining_slices > 1;
+                   remaining_slices = Math.ceil(remaining_slices / 2)) {
+                code += `
+    // Merge tensor slices ${remaining_slices} -> ${Math.ceil(remaining_slices / 2)}
+    // Sub-step A: Store upper-half reg to lower-half SM
+    if (tensor_slice_group >= ${Math.ceil(remaining_slices / 2)}) {
         for (var compute_block_thread_M: u32 = 0; compute_block_thread_M < compute_blocks_per_thread_M; compute_block_thread_M++) {
             for (var compute_block_thread_N: u32 = 0; compute_block_thread_N < compute_blocks_per_thread_N; compute_block_thread_N++) {
+                let reg_acc = &acc_array[compute_block_thread_M][compute_block_thread_N];
                 tensor_slice_acc
+                    [tensor_slice_group-${Math.ceil(remaining_slices / 2)}]
                     [compute_blocks_thread_workgroup_base_M+compute_block_thread_M]
-                    [compute_blocks_thread_workgroup_base_N+compute_block_thread_N]
-                    [tensor_slice_group-${Math.ceil(tensor_slice_factor / 2)}] =
-                    acc_array[compute_block_thread_M][compute_block_thread_N];
+                    [compute_blocks_thread_workgroup_base_N+compute_block_thread_N] =
+                    *reg_acc;
             }
         }
     }
     workgroupBarrier();
-    ${(() => {
-              let code = '';
-              for (let remaining_slices = Math.ceil(tensor_slice_factor / 2); remaining_slices > 1;
-                   remaining_slices = Math.ceil(remaining_slices / 2)) {
-                code += `
-    if (tensor_slice_group >= ${Math.ceil(remaining_slices / 2)}) {
+    // Sub-step B: Lower-half add SM into reg
+    if (tensor_slice_group < ${Math.ceil(remaining_slices / 2)}) {
         for (var compute_block_thread_M: u32 = 0; compute_block_thread_M < compute_blocks_per_thread_M; compute_block_thread_M++) {
             for (var compute_block_thread_N: u32 = 0; compute_block_thread_N < compute_blocks_per_thread_N; compute_block_thread_N++) {
                 let workgroup_acc =
-                    &tensor_slice_acc
-                        [compute_blocks_thread_workgroup_base_M+compute_block_thread_M]
-                        [compute_blocks_thread_workgroup_base_N+compute_block_thread_N]
-                        [tensor_slice_group];
+                      &tensor_slice_acc
+                          [tensor_slice_group]
+                          [compute_blocks_thread_workgroup_base_M+compute_block_thread_M]
+                          [compute_blocks_thread_workgroup_base_N+compute_block_thread_N];
                 let reg_acc = &acc_array[compute_block_thread_M][compute_block_thread_N];
                 ${addIdent(addOutputBlocksStats('(*reg_acc)', '(*workgroup_acc)'), 16, 'keepFirstLine')}
-                tensor_slice_acc
-                    [compute_blocks_thread_workgroup_base_M+compute_block_thread_M]
-                    [compute_blocks_thread_workgroup_base_N+compute_block_thread_N]
-                    [tensor_slice_group-${Math.ceil(remaining_slices / 2)}] =
-                    *reg_acc;
             }
         }
     }
@@ -1190,15 +1189,6 @@ fn main(
               }
               return code;
             })()}
-    if (tensor_slice_group == 0) {
-        let workgroup_acc =
-            &tensor_slice_acc
-                [compute_blocks_thread_workgroup_base_M+compute_block_thread_M]
-                [compute_blocks_thread_workgroup_base_N+compute_block_thread_N]
-                [0];
-        let reg_acc = &acc_array[compute_block_thread_M][compute_block_thread_N];
-        ${addIdent(addOutputBlocksStats('(*reg_acc)', '(*workgroup_acc)'), 8, 'keepFirstLine')}
-    }
 ` :
                                       ''}
     //Write back results in register
@@ -1216,7 +1206,7 @@ fn main(
 }
 
 `;
-        LOG('fatal', `shader: \n ${shader}`);
+        // LOG('fatal', `shader: \n ${shader}`);
         return shader;
       }
 
@@ -1224,6 +1214,8 @@ fn main(
     activation,
     workgroup_params,
     compute_block_shape,
+    compute_blocks_per_workgroup,
+    tensor_slice_factor,
     input_A_layoout: input_A.buffer_layout,
     input_B_layoout: input_B.buffer_layout,
     output_layoout: output.buffer_layout,
@@ -1334,7 +1326,8 @@ input A batches ${batchAggregatedInputs[0].dims[0]} * input B batches ${batchAgg
         compute_schema: 'scaledVector',
         // compute_schema: 'dotProduct',
         tensor_slice: {
-          tensor_slice_factor: 1,
+          // tensor_slice_factor: 1,
+          tensor_slice_factor: 4,
           tensor_slice_input_policy: 'continious',
         },
       };
