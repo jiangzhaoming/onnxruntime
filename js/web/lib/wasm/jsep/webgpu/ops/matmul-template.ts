@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 import {DataType} from '../../../wasm-common';
-import { LOG } from '../../log';
+import {LOG} from '../../log';
 import {TensorView} from '../../tensor-view';
 import {/*BroadcastUtil,*/ ShapeUtil} from '../../util';
 import {/*ComputeContext,*/ ProgramInfo, ProgramUniform} from '../types';
@@ -113,7 +113,9 @@ const addIdent = (code: string, width: number, first_line_hint: 'keepFirstLine'|
   const ident = ' '.repeat(width);
   return (
       code.split('\n')
-          .map((line, i) => (line === '' || ((first_line_hint === 'keepFirstLine') && (i === 0))) ? line : (ident + line))
+          .map(
+              (line, i) =>
+                  (line === '' || ((first_line_hint === 'keepFirstLine') && (i === 0))) ? line : (ident + line))
           .join('\n')  //
   );
 };
@@ -177,8 +179,11 @@ const u32LoopUpFrom0WGSL = (
     loop_var_name: string,
     upper_boundary: number|string,  // cond: loop_var_or_value < upper_boundary
     loop_body: (loop_var_or_value: string|number) => string,
+    disable_unfold: boolean = false,
     outer_ident_width: number = 0,
-    ) => integerLoopUpFrom0WGSL(loop_var_name, 'u32', upper_boundary, loop_body, outer_ident_width);
+    ) =>
+    integerLoopUpFrom0WGSL(
+        loop_var_name, 'u32', disable_unfold ? `${upper_boundary}` : upper_boundary, loop_body, outer_ident_width);
 
 interface RowsColsSpan {
   rows: number;
@@ -263,34 +268,68 @@ const generateVectorizedComputeStatements = (
              return `${inputVectorWGSLs[inputRowGroupId][inputColGroupId]}.${'xyzw'[inputVectorElement]}`;
            }));
   const inputAScalarAccessor = inputScalarAccessorBuilder(inputAVectorWGSLs, inputAVectorSize);
-  const inputBScalarAccessor = inputScalarAccessorBuilder(inputBVectorWGSLs, inputBVectorSize);
-  /*
-  const inputAScalarAccessor = (inputARowGroupId: number, inputAColGroupId: number, inputAVectorElement: number) => {
-    if (inputAVectorSize === 1) {
-      if ((typeof inputAVectorElement === 'number') && (inputAVectorElement !== 0)) {
-        throw (`Accessing unexpected component ${inputAVectorElement} on scalar type input A`);
-      }
-    }
-    return `${inputAVectorWGSLs[inputARowGroupId][inputAColGroupId]}${
-        inputAVectorSize === 1 ? '' : `.${'xyzw'[inputAVectorElement]}`}`;
-  };
-  const inputBScalarAccessor = (inputBRowGroupId: number, inputBColGroupId: number, inputBVectorElement: number) => {
-    if (inputBVectorSize === 1) {
-      if ((typeof inputBVectorElement === 'number') && (inputBVectorElement !== 0)) {
-        throw (`Accessing unexpected component ${inputBVectorElement} on scalar type input B`);
-      }
-    }
-    return `${inputBVectorWGSLs[inputBRowGroupId][inputBColGroupId]}${
-        inputBVectorSize === 1 ? '' : `.${'xyzw'[inputBVectorElement]}`}`;
-  };
-  */
+  // const inputBScalarAccessor = inputScalarAccessorBuilder(inputBVectorWGSLs, inputBVectorSize);
 
   const inputAScalarPositionAccessor = (scalarRow: number, scalarCol: number) => (inputAVectorDirection === 'row') ?
       `${inputAScalarAccessor(scalarRow, Math.floor(scalarCol / inputAVectorSize), scalarCol % inputAVectorSize)}` :
       `${inputAScalarAccessor(Math.floor(scalarRow / inputAVectorSize), scalarCol, scalarRow % inputAVectorSize)}`;
+  /*
   const inputBScalarPositionAccessor = (scalarRow: number, scalarCol: number) => (inputBVectorDirection === 'row') ?
-      `${inputBScalarAccessor(scalarRow, Math.floor(scalarCol / inputBVectorSize), scalarCol % inputBVectorSize)}` :
-      `${inputBScalarAccessor(Math.floor(scalarRow / inputBVectorSize), scalarCol, scalarRow % inputBVectorSize)}`;
+  `${inputBScalarAccessor(scalarRow, Math.floor(scalarCol / inputBVectorSize), scalarCol % inputBVectorSize)}` :
+  `${inputBScalarAccessor(Math.floor(scalarRow / inputBVectorSize), scalarCol, scalarRow % inputBVectorSize)}`;
+  */
+
+  interface InputAccessingTrace {
+    loading_point_row: number;
+    loading_point_col: number;
+    loading_point_components: number[];
+  }
+  ;
+  const inputScalarPositionAccessingTracesBuilder = (inputVectorDirection: 'row'|'col', inputVectorSize: 1|2|4) =>
+      ((scalarRow: number, scalarCol: number) => (inputVectorDirection === 'row') ?
+           {
+             loading_point_row: scalarRow,
+             loading_point_col: Math.floor(scalarCol / inputVectorSize),
+             loading_point_components: [scalarCol % inputVectorSize]
+           } as InputAccessingTrace :
+           {
+             loading_point_row: Math.floor(scalarRow / inputVectorSize),
+             loading_point_col: scalarCol,
+             loading_point_components: [scalarRow % inputVectorSize]
+           } as InputAccessingTrace);
+  const inputAScalarPositionAccessingTraces =
+      inputScalarPositionAccessingTracesBuilder(inputAVectorDirection, inputAVectorSize);
+  const inputBScalarPositionAccessingTraces =
+      inputScalarPositionAccessingTracesBuilder(inputBVectorDirection, inputBVectorSize);
+
+  const aggregateInputAccessingTraces = (traces: readonly InputAccessingTrace[]) => traces.reduceRight(
+      (reduced, previous) => (previous.loading_point_row === reduced[0]?.loading_point_row &&
+                              previous.loading_point_col === reduced[0]?.loading_point_col) ?
+          [
+            {
+              loading_point_row: reduced[0].loading_point_row,
+              loading_point_col: reduced[0].loading_point_col,
+              loading_point_components: [previous.loading_point_components, ...reduced[0].loading_point_components],
+            } as InputAccessingTrace,
+            ...reduced.slice(1)
+          ] :
+          [previous, ...reduced],
+      [] as InputAccessingTrace[]);
+  const vectorFromInputAccessingTracesBuilder =
+      (inputVectorWGSLs: readonly(readonly string[])[], inputVectorSize: 1|2|4) =>
+          (traces: readonly InputAccessingTrace[]) =>
+              traces
+                  .map(
+                      trace => inputVectorSize === 1 ?
+                          `${
+                              trace.loading_point_components.length > 1 ?
+                                  `vec${trace.loading_point_components.length}` :
+                                  ''}(${inputVectorWGSLs[trace.loading_point_row][trace.loading_point_col]})` :
+                          `${inputVectorWGSLs[trace.loading_point_row][trace.loading_point_col]}.${
+                              trace.loading_point_components.map(i => 'xyzw'[i]).join('')}`)
+                  .join(', ');
+  const vectorFromInputAAccessingTraces = vectorFromInputAccessingTracesBuilder(inputAVectorWGSLs, inputAVectorSize);
+  const vectorFromInputBAccessingTraces = vectorFromInputAccessingTracesBuilder(inputBVectorWGSLs, inputBVectorSize);
 
   const biasedOutputPackedRow = (bias: string|number) =>
       ((typeof outputSpanUpperLeftPositionPackedRow === 'number') && (typeof bias === 'number')) ?
@@ -325,16 +364,14 @@ const generateVectorizedComputeStatements = (
 
   const computeDotProdAmongK = (outputScalarRow: number, outputScalarCol: number) => {
     const kDimensionSize = inputAScalarCols;
-    if (kDimensionSize < 2) {
-      throw (`K dimension size ${kDimensionSize} is too small`);
-    }
     const gatherRowVectorFromInputA = (scalarRow: number, scalarCol: number, vectorSize: 1|2|4) => {
       if ((scalarRow >= inputAScalarRows) || (scalarCol + vectorSize > kDimensionSize)) {
         throw (`gatherRowVectorFromInputA OOB, requiring [${scalarRow}][${scalarCol}:+${
             vectorSize}] on input A with scalars [${inputAScalarRows}][${kDimensionSize}]`);
       }
       return `${vectorSize === 1 ? scalarTypeWGSL : `vec${vectorSize}<${scalarTypeWGSL}>`}(${
-          arrayMap(vectorSize, (col) => `${inputAScalarPositionAccessor(scalarRow, scalarCol + col)}`).join(', ')})`;
+          vectorFromInputAAccessingTraces(aggregateInputAccessingTraces(
+              arrayMap(vectorSize, (col) => inputAScalarPositionAccessingTraces(scalarRow, scalarCol + col))))})`;
     };
     const gatherColVectorFromInputB = (scalarRow: number, scalarCol: number, vectorSize: 1|2|4) => {
       if ((scalarRow + vectorSize > kDimensionSize) || (scalarCol > inputBScalarCols)) {
@@ -342,9 +379,10 @@ const generateVectorizedComputeStatements = (
             scalarCol}] on input B with scalars [${kDimensionSize}][${inputBScalarCols}]`);
       }
       return `${vectorSize === 1 ? scalarTypeWGSL : `vec${vectorSize}<${scalarTypeWGSL}>`}(${
-          arrayMap(vectorSize, (row) => `${inputBScalarPositionAccessor(scalarRow + row, scalarCol)}`).join(', ')})`;
+          vectorFromInputBAccessingTraces(aggregateInputAccessingTraces(
+              arrayMap(vectorSize, (row) => inputBScalarPositionAccessingTraces(scalarRow + row, scalarCol))))})`;
     };
-    // const dotProdStepSize = (kDimensionSize % 4 === 0)?4:((kDimensionSize % 2 === 0)?2:1);
+    // Divide kDimensionSize to kDimensionSizeOf4 + kDimensionSizeOf2 + kDimensionSizeOf1
     const kDimensionSizeOf4 = Math.floor(kDimensionSize / 4) * 4;
     const kDimensionSizeOf2 = Math.floor((kDimensionSize - kDimensionSizeOf4) / 2) * 2;
     const kDimensionSizeOf1 = kDimensionSize - kDimensionSizeOf4 - kDimensionSizeOf2;
@@ -381,10 +419,11 @@ const generateVectorizedComputeStatements = (
     const gatherRowVectorFromInputB = (scalarRow: number, scalarCol: number, vectorSize: 1|2|4) => {
       if ((scalarRow >= inputBScalarRows) || (scalarCol + vectorSize > inputBScalarCols)) {
         throw (`gatherRowVectorFromInputB OOB, requiring [${scalarRow}][${scalarCol}:+${
-            vectorSize}] on input A with scalars [${inputBScalarRows}][${inputBScalarCols}]`);
+            vectorSize}] on input B with scalars [${inputBScalarRows}][${inputBScalarCols}]`);
       }
       return `${vectorSize === 1 ? scalarTypeWGSL : `vec${vectorSize}<${scalarTypeWGSL}>`}(${
-          arrayMap(vectorSize, (col) => `${inputBScalarPositionAccessor(scalarRow, scalarCol + col)}`).join(', ')})`;
+          vectorFromInputBAccessingTraces(aggregateInputAccessingTraces(
+              arrayMap(vectorSize, (col) => inputBScalarPositionAccessingTraces(scalarRow, scalarCol + col))))})`;
     };
 
     return (
@@ -400,6 +439,157 @@ const generateVectorizedComputeStatements = (
     );
   }
 };
+
+interface TSGBlockCacheHelper {
+  cacheMemoryModuleDefinitionWGSL: () => string;
+  cacheMemoryFunctionDefinitionWGSL: () => string;
+  cacheMemoryUpdateStatsWGSL: (unfoldStepLoop?: boolean) => string;
+  get loadingPointAccessingInCacheExpr():
+      (row_in_cache: string|number, col_in_cache: string|number, TSG: string) => string;
+}
+
+interface TSGBlockCacheHelperConstructorParams {
+  variable_name: string;
+  threads_per_TSG: number;
+  loading_points_per_compute_block: RowsColsSpan;
+  cache_compute_blocks_per_TSG: RowsColsSpan;
+  loading_point_WGSL_type: string;
+  cache_step_loading_point_row_in_TSG_base_WGSL: string;
+  cache_step_loading_point_col_in_TSG_base_WGSL: string;
+  sourceLoadingPointTSGAccessingExpr: (TSG: string, row_in_TSG: string, col_in_TSG: string) => string;
+  loading_points_prefer_major: 'row'|'col';
+}
+;
+
+class TSGBlockCacheHelperBase {
+  readonly variable_name: string;
+  // tensor_slice_groups: number;
+  readonly threads_per_TSG: number;
+  readonly loading_points_per_compute_block: RowsColsSpan;
+  //
+  readonly cache_compute_blocks_per_TSG: RowsColsSpan;
+  readonly loading_point_WGSL_type: string;
+  // loading_points_stride_per_TSG: RowsColsSpan;
+  // Cache step base for updating
+  readonly cache_step_loading_point_row_in_TSG_base_WGSL: string;
+  readonly cache_step_loading_point_col_in_TSG_base_WGSL: string;
+  readonly sourceLoadingPointTSGAccessingExpr: (TSG: string, row_in_TSG: string, col_in_TSG: string) => string;
+  // Threads in lock step prefer loading loading points from the same row/col
+  readonly loading_points_prefer_major: 'row'|'col';
+
+  // Computed
+  loading_points_per_TSG: RowsColsSpan;
+  cache_name: string;
+
+  constructor(params: TSGBlockCacheHelperConstructorParams) {
+    this.variable_name = params.variable_name;
+    this.threads_per_TSG = params.threads_per_TSG;
+    this.loading_points_per_compute_block = params.loading_points_per_compute_block;
+    this.cache_compute_blocks_per_TSG = params.cache_compute_blocks_per_TSG;
+    this.loading_point_WGSL_type = params.loading_point_WGSL_type;
+    // this.loading_points_stride_per_TSG = loading_points_stride_per_TSG;
+    this.cache_step_loading_point_row_in_TSG_base_WGSL = params.cache_step_loading_point_row_in_TSG_base_WGSL;
+    this.cache_step_loading_point_col_in_TSG_base_WGSL = params.cache_step_loading_point_col_in_TSG_base_WGSL;
+    this.sourceLoadingPointTSGAccessingExpr = params.sourceLoadingPointTSGAccessingExpr;
+    this.loading_points_prefer_major = params.loading_points_prefer_major;
+
+    this.loading_points_per_TSG = {
+      rows: this.cache_compute_blocks_per_TSG.rows * this.loading_points_per_compute_block.rows,
+      cols: this.cache_compute_blocks_per_TSG.cols * this.loading_points_per_compute_block.cols,
+    };
+    this.cache_name = `shared_memory_cache_${this.variable_name}`;
+  }
+}
+
+export class VoidCacheHelper extends TSGBlockCacheHelperBase implements TSGBlockCacheHelper {
+  constructor(params: TSGBlockCacheHelperConstructorParams) {
+    super(params);
+  }
+
+  cacheMemoryModuleDefinitionWGSL() {
+    return ``;
+  }
+  cacheMemoryFunctionDefinitionWGSL() {
+    return ``;
+  }
+  cacheMemoryUpdateStatsWGSL() {
+    return ``;
+  }
+  get loadingPointAccessingInCacheExpr() {
+    return (row_in_cache: string|number, col_in_cache: string|number, TSG: string) => `${
+               this.sourceLoadingPointTSGAccessingExpr(
+                   TSG,
+                   `(/*row_in_cache*/ ${row_in_cache} + /*cache_step_loading_point_row_in_TSG_base_WGSL*/ ${
+                       this.cache_step_loading_point_row_in_TSG_base_WGSL})`,
+                   `(/*col_in_cache*/ ${col_in_cache} + /*cache_step_loading_point_col_in_TSG_base_WGSL*/ ${
+                       this.cache_step_loading_point_col_in_TSG_base_WGSL})`)}`;
+  }
+}
+
+export class SharedMemoryCacheHelper extends TSGBlockCacheHelperBase implements TSGBlockCacheHelper {
+  constructor(params: TSGBlockCacheHelperConstructorParams) {
+    super(params);
+  }
+
+  cacheMemoryModuleDefinitionWGSL() {
+    return `
+const ${this.cache_name}_loading_point_rows_per_TSG = ${this.loading_points_per_TSG.rows}u;
+const ${this.cache_name}_loading_point_cols_per_TSG = ${this.loading_points_per_TSG.cols}u;
+var<workgroup> ${this.cache_name}: array<array<array<${this.loading_point_WGSL_type}, ${
+        this.cache_name}_loading_point_cols_per_TSG, ${
+        this.cache_name}_loading_point_rows_per_TSG>, tensor_slice_groups>;
+`;
+  }
+
+  cacheMemoryFunctionDefinitionWGSL() {
+    return ``;
+  }
+
+  // workgroupBarrier should be used properly before and after update
+  cacheMemoryUpdateStatsWGSL(unfoldStepLoop: boolean = false) {
+    const loading_points_number_per_TSG = this.loading_points_per_TSG.rows * this.loading_points_per_TSG.cols;
+    const steps = Math.ceil(loading_points_number_per_TSG / this.threads_per_TSG);
+    const steps_loop_boundary = unfoldStepLoop ? steps : `${steps}`;
+    const loading_points_major_stride = this.loading_points_prefer_major === 'row' ? this.loading_points_per_TSG.cols :
+                                                                                     this.loading_points_per_TSG.rows;
+    const loading_id_to_loading_point_major =
+        ((Number.isInteger(Math.log2(loading_points_major_stride))) ?
+             `(loading_id_in_TSG & ${loading_points_major_stride - 1})` :
+             `(loading_id_in_TSG % ${loading_points_major_stride})`);
+    const loading_id_to_loading_point_minor =
+        ((Number.isInteger(Math.log2(loading_points_major_stride))) ?
+             `(loading_id_in_TSG >> ${Math.log2(loading_points_major_stride)})` :
+             `(loading_id_in_TSG / ${loading_points_major_stride})`);
+    return `
+{
+    let cache_step_loading_point_row_in_TSG_base: i32 = i32(${this.cache_step_loading_point_row_in_TSG_base_WGSL});
+    let cache_step_loading_point_col_in_TSG_base: i32 = i32(${this.cache_step_loading_point_col_in_TSG_base_WGSL});
+
+    ${
+        u32LoopUpFrom0WGSL(
+            'step', steps_loop_boundary,
+            step_var_or_value => `
+        let loading_id_in_TSG = thread_in_TSG + ${step_var_or_value} * ${this.threads_per_TSG};
+        let loading_point_col_in_TSG = cache_step_loading_point_col_in_TSG_base + ${
+                this.loading_points_prefer_major === 'row' ? loading_id_to_loading_point_major :
+                                                             loading_id_to_loading_point_minor};
+        let loading_point_row_in_TSG = cache_step_loading_point_row_in_TSG_base + ${
+                this.loading_points_prefer_major === 'row' ? loading_id_to_loading_point_minor :
+                                                             loading_id_to_loading_point_major};
+        let loading_point_target = &(${this.cache_name}[TSG][loading_point_row_in_TSG][loading_point_col_in_TSG]);
+        *loading_point_target = ${
+                this.sourceLoadingPointTSGAccessingExpr('TSG', 'loading_point_row_in_TSG', 'loading_point_col_in_TSG')};
+`,
+            false, 4)}
+}
+`;
+  }
+
+  get loadingPointAccessingInCacheExpr() {
+    return (row_in_cache: string|number, col_in_cache: string|number, TSG: string) =>
+               `${this.cache_name}[${TSG}][${row_in_cache}][${col_in_cache}]`;
+  }
+}
 
 export function templatedMatMulProgram(
     op_params: GEMMOperationParameters,
@@ -509,7 +699,12 @@ dividable by compute_block_shape ${PrintMKN(compute_block_shape)}`);
   //   Scheduling decision
   // -----------------------------------------------------------------------------
   // TODO: Should be decided by schedule.
-  const compute_block_thread_K_inner_loop_step: number|string = 1;
+  const spatial_loop_order: 'M_outer'|'N_outer' = 'M_outer';
+  const outer_spatial_dim = spatial_loop_order === 'M_outer' ? 'M' : 'N';
+  const inner_spatial_dim = spatial_loop_order === 'M_outer' ? 'N' : 'M';
+  const unfold_spatial_loop: boolean = false;
+  // const compute_block_thread_K_inner_loop_step: number|string = 1;
+  const compute_block_thread_K_inner_loop_step: number|string = 2;
   assert(
       workgroup_params.threads_per_workgroup % tensor_slice_factor === 0,
       `Workgroup size ${workgroup_params.threads_per_workgroup} should be a multiple of tensor_slice_factor ${
@@ -562,24 +757,22 @@ dividable by compute_block_shape ${PrintMKN(compute_block_shape)}`);
   appendActivationUniformsData(activation, programUniforms);
   // Tensor shapes of all input/output variables must be pushed into programUniforms
   assert(
-    input_A.buffer_layout.buffer_inner_boundary ===
-        ((input_A.buffer_layout.loading_points_layout === 'NHW') ? logical_scalar_size.M : logical_scalar_size.K),
-    `Expect for layout ${input_A.buffer_layout.loading_points_layout} \
+      input_A.buffer_layout.buffer_inner_boundary ===
+          ((input_A.buffer_layout.loading_points_layout === 'NHW') ? logical_scalar_size.M : logical_scalar_size.K),
+      `Expect for layout ${input_A.buffer_layout.loading_points_layout} \
 input_A.buffer_layout.buffer_inner_boundary ${input_A.buffer_layout.buffer_inner_boundary} === \
-${(input_A.buffer_layout.loading_points_layout === 'NHW') ?
-    `logical_scalar_size.M ${logical_scalar_size.M}` :
-    `logical_scalar_size.K ${logical_scalar_size.K}`}`
-  );
+${
+          (input_A.buffer_layout.loading_points_layout === 'NHW') ? `logical_scalar_size.M ${logical_scalar_size.M}` :
+                                                                    `logical_scalar_size.K ${logical_scalar_size.K}`}`);
   assert(
-    input_A.buffer_layout.buffer_outer_boundary * input_A.buffer_layout.packed_vector_size ===
-        (input_A.buffer_layout.loading_points_layout === 'NHW' ? logical_scalar_size.K : logical_scalar_size.M),
-    `Expect for layout ${input_A.buffer_layout.loading_points_layout} \
+      input_A.buffer_layout.buffer_outer_boundary * input_A.buffer_layout.packed_vector_size ===
+          (input_A.buffer_layout.loading_points_layout === 'NHW' ? logical_scalar_size.K : logical_scalar_size.M),
+      `Expect for layout ${input_A.buffer_layout.loading_points_layout} \
 input_A.buffer_layout.buffer_outer_boundary ${input_A.buffer_layout.buffer_outer_boundary} * \
     input_A.buffer_layout.packed_vector_size ${input_A.buffer_layout.packed_vector_size} === \
-${(input_A.buffer_layout.loading_points_layout === 'NHW') ?
-    `logical_scalar_size.K ${logical_scalar_size.K}` :
-    `logical_scalar_size.M ${logical_scalar_size.M}`}`
-  );
+${
+          (input_A.buffer_layout.loading_points_layout === 'NHW') ? `logical_scalar_size.K ${logical_scalar_size.K}` :
+                                                                    `logical_scalar_size.M ${logical_scalar_size.M}`}`);
   const input_A_tensor_loading_points_shape = [
     input_A.aggregated_batches,
     // input_A.buffer_layout.loading_points_layout === 'NHW' ? logical_scalar_size.M : logical_scalar_size.K,
@@ -589,24 +782,22 @@ ${(input_A.buffer_layout.loading_points_layout === 'NHW') ?
   ];
 
   assert(
-    input_B.buffer_layout.buffer_inner_boundary ===
-        ((input_B.buffer_layout.loading_points_layout === 'NHW') ? logical_scalar_size.K : logical_scalar_size.N),
-    `Expect for layout ${input_B.buffer_layout.loading_points_layout} \
+      input_B.buffer_layout.buffer_inner_boundary ===
+          ((input_B.buffer_layout.loading_points_layout === 'NHW') ? logical_scalar_size.K : logical_scalar_size.N),
+      `Expect for layout ${input_B.buffer_layout.loading_points_layout} \
 input_B.buffer_layout.buffer_inner_boundary ${input_B.buffer_layout.buffer_inner_boundary} === \
-${(input_B.buffer_layout.loading_points_layout === 'NHW') ?
-    `logical_scalar_size.K ${logical_scalar_size.K}` :
-    `logical_scalar_size.N ${logical_scalar_size.N}`}`
-  );
+${
+          (input_B.buffer_layout.loading_points_layout === 'NHW') ? `logical_scalar_size.K ${logical_scalar_size.K}` :
+                                                                    `logical_scalar_size.N ${logical_scalar_size.N}`}`);
   assert(
-    input_B.buffer_layout.buffer_outer_boundary * input_B.buffer_layout.packed_vector_size ===
-        (input_B.buffer_layout.loading_points_layout === 'NHW' ? logical_scalar_size.N : logical_scalar_size.K),
-    `Expect for layout ${input_B.buffer_layout.loading_points_layout} \
+      input_B.buffer_layout.buffer_outer_boundary * input_B.buffer_layout.packed_vector_size ===
+          (input_B.buffer_layout.loading_points_layout === 'NHW' ? logical_scalar_size.N : logical_scalar_size.K),
+      `Expect for layout ${input_B.buffer_layout.loading_points_layout} \
 input_B.buffer_layout.buffer_outer_boundary ${input_B.buffer_layout.buffer_outer_boundary} * \
     input_B.buffer_layout.packed_vector_size ${input_B.buffer_layout.packed_vector_size} === \
-${(input_B.buffer_layout.loading_points_layout === 'NHW') ?
-    `logical_scalar_size.N ${logical_scalar_size.N}` :
-    `logical_scalar_size.K ${logical_scalar_size.K}`}`
-  );
+${
+          (input_B.buffer_layout.loading_points_layout === 'NHW') ? `logical_scalar_size.N ${logical_scalar_size.N}` :
+                                                                    `logical_scalar_size.K ${logical_scalar_size.K}`}`);
   const input_B_tensor_loading_points_shape = [
     input_B.aggregated_batches,
     // input_B.buffer_layout.loading_points_layout === 'NHW' ? logical_scalar_size.K : logical_scalar_size.N,
@@ -616,24 +807,22 @@ ${(input_B.buffer_layout.loading_points_layout === 'NHW') ?
   ];
   assert(output.buffer_layout.loading_points_layout === 'NHW', `Currently output tensor must be in NHW layout`)
   assert(
-    output.buffer_layout.buffer_inner_boundary ===
-        ((output.buffer_layout.loading_points_layout === 'NHW') ? logical_scalar_size.M : logical_scalar_size.N),
-    `Expect for layout ${output.buffer_layout.loading_points_layout} \
+      output.buffer_layout.buffer_inner_boundary ===
+          ((output.buffer_layout.loading_points_layout === 'NHW') ? logical_scalar_size.M : logical_scalar_size.N),
+      `Expect for layout ${output.buffer_layout.loading_points_layout} \
 output.buffer_layout.buffer_inner_boundary ${output.buffer_layout.buffer_inner_boundary} === \
-${(output.buffer_layout.loading_points_layout === 'NHW') ?
-    `logical_scalar_size.M ${logical_scalar_size.M}` :
-    `logical_scalar_size.N ${logical_scalar_size.N}`}`
-  );
+${
+          (output.buffer_layout.loading_points_layout === 'NHW') ? `logical_scalar_size.M ${logical_scalar_size.M}` :
+                                                                   `logical_scalar_size.N ${logical_scalar_size.N}`}`);
   assert(
-    output.buffer_layout.buffer_outer_boundary * output.buffer_layout.packed_vector_size ===
-        (output.buffer_layout.loading_points_layout === 'NHW' ? logical_scalar_size.N : logical_scalar_size.M),
-    `Expect for layout ${output.buffer_layout.loading_points_layout} \
+      output.buffer_layout.buffer_outer_boundary * output.buffer_layout.packed_vector_size ===
+          (output.buffer_layout.loading_points_layout === 'NHW' ? logical_scalar_size.N : logical_scalar_size.M),
+      `Expect for layout ${output.buffer_layout.loading_points_layout} \
 output.buffer_layout.buffer_outer_boundary ${output.buffer_layout.buffer_outer_boundary} * \
     output.buffer_layout.packed_vector_size ${output.buffer_layout.packed_vector_size} === \
-${(output.buffer_layout.loading_points_layout === 'NHW') ?
-    `logical_scalar_size.N ${logical_scalar_size.N}` :
-    `logical_scalar_size.M ${logical_scalar_size.M}`}`
-  );
+${
+          (output.buffer_layout.loading_points_layout === 'NHW') ? `logical_scalar_size.N ${logical_scalar_size.N}` :
+                                                                   `logical_scalar_size.M ${logical_scalar_size.M}`}`);
   const output_tensor_loading_points_shape = [
     output.aggregated_batches,
     // output.buffer_layout.loading_points_layout === 'NHW' ? logical_scalar_size.M : logical_scalar_size.N,
@@ -641,8 +830,14 @@ ${(output.buffer_layout.loading_points_layout === 'NHW') ?
     output.buffer_layout.buffer_inner_boundary,
     output.buffer_layout.buffer_outer_boundary,
   ];
-  const unaggregated_output_tensor_shape = [...batches_info.output_batch_dims, output.buffer_layout.buffer_inner_boundary, output.buffer_layout.buffer_outer_boundary * output.buffer_layout.packed_vector_size];
-  const input_tensors_shape = [input_A_tensor_loading_points_shape, input_B_tensor_loading_points_shape, ...(has_bias ? [output_tensor_loading_points_shape] : [])];
+  const unaggregated_output_tensor_shape = [
+    ...batches_info.output_batch_dims, output.buffer_layout.buffer_inner_boundary,
+    output.buffer_layout.buffer_outer_boundary * output.buffer_layout.packed_vector_size
+  ];
+  const input_tensors_shape = [
+    input_A_tensor_loading_points_shape, input_B_tensor_loading_points_shape,
+    ...(has_bias ? [output_tensor_loading_points_shape] : [])
+  ];
   programUniforms.push(...createTensorShapeVariables(...input_tensors_shape));
   programUniforms.push(...createTensorShapeVariables(output_tensor_loading_points_shape));
 
@@ -686,6 +881,7 @@ ${(output.buffer_layout.loading_points_layout === 'NHW') ?
         const helper_functions: Map<string /* function name */, string /* function definition */> =
             new Map<string, string>;
 
+        // Batch indices helper
         helper_functions.set(
             'ConvertOutputBatchToInputBatch',
             `
@@ -720,6 +916,7 @@ fn ConvertOutputBatchToInputBatch(output_batch: u32) -> vec2<u32> {
     return vec2<u32>(input_A_batch, input_B_batch);
 }`);
 
+        // Buffer accessing helper functions and expr/stats
         const createLoadBufferHelperFunction = (
             function_name: string,
             buffer_variable: IndicesHelper,
@@ -733,16 +930,19 @@ fn ConvertOutputBatchToInputBatch(output_batch: u32) -> vec2<u32> {
 
           const {loading_points_layout, buffer_inner_boundary, buffer_outer_boundary} = buffer_layout;
 
-          helper_functions.set(function_name, `
+          helper_functions.set(
+              function_name,
+              `
 // Load a loading point at logical position [batch][row][col] from a matrix buffer.
-fn ${function_name}(loading_point_row: i32, loading_point_col: i32, batch: i32) -> ${packed_type_in_buffer_WGSL} {
+fn ${function_name}(loading_point_row: i32, loading_point_col: i32, batch: u32) -> ${packed_type_in_buffer_WGSL} {
     var value = ${packed_type_in_buffer_WGSL}(0.0);
 
     // Handle possible transposed layout
     let inner_dim = ${loading_points_layout === 'NHW' ? 'loading_point_row' : 'loading_point_col'};
     let outer_dim = ${loading_points_layout === 'NHW' ? 'loading_point_col' : 'loading_point_row'};
 
-    if (inner_dim >= 0 && inner_dim < ${buffer_inner_boundary} && outer_dim >= 0 && outer_dim < ${buffer_outer_boundary})
+    if (inner_dim >= 0 && inner_dim < ${buffer_inner_boundary} && outer_dim >= 0 && outer_dim < ${
+                  buffer_outer_boundary})
     {
         // Within boundary, read from buffer[batch][inner_dim][outer_dim].
         var indices: ${buffer_variable.type.indices};
@@ -778,14 +978,17 @@ fn ${function_name}(loading_point_row: i32, loading_point_col: i32, batch: i32) 
 
           const {loading_points_layout, buffer_inner_boundary, buffer_outer_boundary} = buffer_layout;
 
-            helper_functions.set(function_name, `
+          helper_functions.set(
+              function_name,
+              `
 // Store a loading point at logical position [batch][row][col] from a matrix buffer.
-fn ${function_name}(value: ${packed_type_in_buffer_WGSL}, loading_point_row: i32, loading_point_col: i32, batch: i32) {
+fn ${function_name}(value: ${packed_type_in_buffer_WGSL}, loading_point_row: i32, loading_point_col: i32, batch: u32) {
     // Handle possible transposed layout
     let inner_dim = ${loading_points_layout === 'NHW' ? 'loading_point_row' : 'loading_point_col'};
     let outer_dim = ${loading_points_layout === 'NHW' ? 'loading_point_col' : 'loading_point_row'};
 
-    if (inner_dim >= 0 && inner_dim < ${buffer_inner_boundary} && outer_dim >= 0 && outer_dim < ${buffer_outer_boundary})
+    if (inner_dim >= 0 && inner_dim < ${buffer_inner_boundary} && outer_dim >= 0 && outer_dim < ${
+                  buffer_outer_boundary})
     {
         // Within boundary, read from buffer[batch][inner_dim][outer_dim].
         var indices: ${buffer_variable.type.indices};
@@ -812,10 +1015,81 @@ fn ${function_name}(value: ${packed_type_in_buffer_WGSL}, loading_point_row: i32
             callBufferLoadingFunctionExprBuilder(buffer_Bias_loading_function_name!, 'batch_output') :
             undefined;
 
-        const loadInputBlockFromBufferStatsBuilder = (
+        const getBufferLoadingPointInTSGExprBuilder =
+            (callBufferLoadingFunctionExpr: (loading_point_row: string, loading_point_col: string) => string,
+             TSG_global_row_base: string, TSG_global_col_base: string) =>
+                ((loading_point_row_in_TSG: number|string, loading_point_col_in_TSG: number|string) =>
+                     callBufferLoadingFunctionExpr(
+                         `(/*loading_point_row_in_TSG*/ ${loading_point_row_in_TSG} + /*TSG_global_row_base*/ ${
+                             TSG_global_row_base})`,
+                         `(/*loading_point_col_in_TSG*/ ${loading_point_col_in_TSG} + /*TSG_global_col_base*/ ${
+                             TSG_global_col_base})`));
+
+        const getBufferALoadingPointInTSGExpr = getBufferLoadingPointInTSGExprBuilder(
+            callBufferALoadingFunctionExpr, 'i32(loading_point_A_TSG_global_row_base)',
+            'i32(loading_point_A_TSG_global_col_base)');
+        const getBufferBLoadingPointInTSGExpr = getBufferLoadingPointInTSGExprBuilder(
+            callBufferBLoadingFunctionExpr, 'i32(loading_point_B_TSG_global_row_base)',
+            'i32(loading_point_B_TSG_global_col_base)');
+        /*
+        const getBufferBiasLoadingPointInTSGExpr = has_bias ?
+            getBufferLoadingPointInTSGExprBuilder(
+                callBufferBiasLoadingFunctionExpr!, 'i32(loading_point_Output_TSG_global_row_base)',
+                'i32(loading_point_Output_TSG_global_col_base)') :
+            undefined;
+        */
+
+        // Get WGSL expression of all loading points of a input block from given position without bias, the bias can be
+        // added in the position or in the loading point accessor
+        const inputBlockLoadingPointsExprWGSLBuilder = (
             loading_points_per_compute_block: RowsColsSpan,
-            callBufferLoadingFunctionExpr: (loading_point_row: number|string, loading_point_col: number|string) =>
-                string,
+            loadingPointAccessorExpr: (loading_point_row: number|string, loading_point_col: number|string) => string,
+            ) =>
+            ((
+                 compute_block_position_row: number|string,
+                 compute_block_position_col: number|string,
+                 ): string[][] => {
+              const loading_point_row_base = (typeof compute_block_position_row === 'number') ?
+                  compute_block_position_row * loading_points_per_compute_block.rows :
+                  `(${compute_block_position_row} * ${loading_points_per_compute_block.rows})`;
+              const loading_point_col_base = (typeof compute_block_position_col === 'number') ?
+                  compute_block_position_col * loading_points_per_compute_block.cols :
+                  `(${compute_block_position_col} * ${loading_points_per_compute_block.cols})`;
+              return (arrayMap(
+                  loading_points_per_compute_block.rows,
+                  (row) => arrayMap(
+                      loading_points_per_compute_block.cols,
+                      (col) => loadingPointAccessorExpr(
+                          `i32(${loading_point_row_base} + ${row})`, `i32(${loading_point_col_base} + ${col})`))));
+            });
+
+        // Assign loading points WGSL to a target
+        const assignLoadingPointsToTargetStats = (
+            loading_target_WGSL: string|string[][],
+            loading_points_WGSL: string[][],
+            ident: number = 0,
+            ): string => {
+          return addIdent(
+              loading_points_WGSL
+                  .map(
+                      (loading_points_in_row, row) =>
+                          loading_points_in_row
+                              .map(
+                                  (loading_point_WGSL, col) => `${
+                                      typeof loading_target_WGSL === 'string' ?
+                                          `${loading_target_WGSL}[${row}][${col}]` :
+                                          loading_target_WGSL[row][col]} = ${loading_point_WGSL};`)
+                              .join('\n'))
+                  .join('\n'),
+              ident, 'keepFirstLine');
+        };
+
+        /*
+        // Load all loading points of a input block from given position without bias, the base can be added in the
+        // position or in the loading point accessor
+        const loadInputBlockStatsBuilder = (
+            loading_points_per_compute_block: RowsColsSpan,
+            loadingPointAccessorExpr: (loading_point_row: number|string, loading_point_col: number|string) => string,
             ) =>
             ((
                  compute_block_position_row: number|string,
@@ -838,18 +1112,20 @@ fn ${function_name}(value: ${packed_type_in_buffer_WGSL}, loading_point_row: i32
                               (col) => `${
                                   typeof loading_target_WGSL === 'string' ? `${loading_target_WGSL}[${row}][${col}]` :
                                                                             loading_target_WGSL[row][col]} = \
-${
-                                  callBufferLoadingFunctionExpr(
-                                      `i32(${loading_point_row_base} + ${row})`,
-                                      `i32(${loading_point_col_base} + ${col})`)};`)
+${loadingPointAccessorExpr(`i32(${loading_point_row_base} + ${row})`, `i32(${loading_point_col_base} + ${col})`)};`)
                               .join('\n'))
                       .join('\n'),
                   ident, 'keepFirstLine');
             });
         const loadInputABlockFromBufferStats =
-            loadInputBlockFromBufferStatsBuilder(loading_points_per_compute_block_A, callBufferALoadingFunctionExpr);
+            loadInputBlockStatsBuilder(loading_points_per_compute_block_A, callBufferALoadingFunctionExpr);
         const loadInputBBlockFromBufferStats =
-            loadInputBlockFromBufferStatsBuilder(loading_points_per_compute_block_B, callBufferBLoadingFunctionExpr);
+            loadInputBlockStatsBuilder(loading_points_per_compute_block_B, callBufferBLoadingFunctionExpr);
+        const loadInputABlockInTSGFromBufferStats =
+            loadInputBlockStatsBuilder(loading_points_per_compute_block_A, getBufferALoadingPointInTSGExpr);
+        const loadInputBBlockInTSGFromBufferStats =
+            loadInputBlockStatsBuilder(loading_points_per_compute_block_B, getBufferBLoadingPointInTSGExpr);
+        */
 
         // Using vectorized computation statements to compute a single compute block
         const calcComputeBlockStats = (
@@ -962,52 +1238,99 @@ ${
             compute_blocks_per_thread_N: string|number,
             ): string => {
           return `
-let output_loading_point_thread_global_base_row = (compute_blocks_thread_workgroup_base_M + compute_blocks_workgroup_global_base_M) * ${
+let output_loading_point_thread_global_base_row = (compute_blocks_thread_TSG_base_M + compute_blocks_workgroup_global_base_M) * ${
               loading_points_per_compute_block_Output.rows};
-let output_loading_point_thread_global_base_col = (compute_blocks_thread_workgroup_base_N + compute_blocks_workgroup_global_base_N) * ${
+let output_loading_point_thread_global_base_col = (compute_blocks_thread_TSG_base_N + compute_blocks_workgroup_global_base_N) * ${
               loading_points_per_compute_block_Output.cols};
 var output_loading_point_block_global_base_row = output_loading_point_thread_global_base_row;
 ${
-                u32LoopUpFrom0WGSL(
-                    'compute_block_thread_M', compute_blocks_per_thread_M,
-                    (compute_block_thread_M: string|number) => `
-    // compute_block_thread_M loop
+              u32LoopUpFrom0WGSL(
+                  'compute_block_thread_M', compute_blocks_per_thread_M,
+                  (compute_block_thread_M: string|number) => `
+    // Begin compute_block_thread_M loop
     var output_loading_point_block_global_base_col = output_loading_point_thread_global_base_col;
     ${
-                        u32LoopUpFrom0WGSL(
-                            'compute_block_thread_N', compute_blocks_per_thread_N,
-                            (compute_block_thread_N: string|number) => `
-        // compute_block_thread_N loop
+                      u32LoopUpFrom0WGSL(
+                          'compute_block_thread_N', compute_blocks_per_thread_N,
+                          (compute_block_thread_N: string|number) => `
+        // Begin compute_block_thread_N loop
         let output_block = &${acc_array_WGSL}[${compute_block_thread_M}][${compute_block_thread_N}];
         ${
-                                arrayMap(
-                                    loading_points_per_compute_block_Output.rows,
-                                    (row) =>  //
-                                    arrayMap(
-                                        loading_points_per_compute_block_Output.cols,
-                                        (col) => `
+                              arrayMap(
+                                  loading_points_per_compute_block_Output.rows,
+                                  (row) =>  //
+                                  arrayMap(
+                                      loading_points_per_compute_block_Output.cols,
+                                      (col) => `
         {
             let output_vector = &((*output_block)[${row}][${col}]);
             let output_loading_points_global_row = output_loading_point_block_global_base_row + ${row};
             let output_loading_points_global_col = output_loading_point_block_global_base_col + ${col};
             // Add bias if any
             ${
-                                            has_bias ? `
+                                          has_bias ? `
             *output_vector += ${
-                                                           callBufferBiasLoadingFunctionExpr!
-                                                           ('output_loading_points_global_row',
-                                                            'output_loading_points_global_col')};` :
-                                                       ''}
+                                                         callBufferBiasLoadingFunctionExpr!
+                                                         ('output_loading_points_global_row',
+                                                          'output_loading_points_global_col')};` :
+                                                     ''}
             // Handle activation if any
             ${getActivationSnippet(activation, output_packed_type_WGSL, scalar_type_WGSL, '(*output_vector)')}
             // Write back output
-            ${buffer_Output_storing_function_name}(*output_vector, i32(output_loading_points_global_row), i32(output_loading_points_global_col), i32(batch_output));
+            ${buffer_Output_storing_function_name}(*output_vector, i32(output_loading_points_global_row), i32(output_loading_points_global_col), batch_output);
         }`).join('\n')).join('\n')}
-        output_loading_point_block_global_base_col += ${loading_points_per_compute_block_Output.cols};`,
-                            /* outer_ident_width */ 4)}
-    output_loading_point_block_global_base_row += ${loading_points_per_compute_block_Output.rows};`)}
+        output_loading_point_block_global_base_col += ${loading_points_per_compute_block_Output.cols};
+        // End compute_block_thread_N loop`,
+                          false,
+                          /* outer_ident_width */ 4)}
+    output_loading_point_block_global_base_row += ${loading_points_per_compute_block_Output.rows};
+    // End compute_block_thread_M loop`)}
 `;
         };
+
+        // -----------------------------------------------------------------------------
+        //   Cache hierarchy
+        // -----------------------------------------------------------------------------
+        const BufferACache: TSGBlockCacheHelper = new VoidCacheHelper({
+          variable_name: 'input_A',
+          threads_per_TSG,
+          loading_points_per_compute_block: loading_points_per_compute_block_A,
+          cache_compute_blocks_per_TSG:
+              {rows: compute_blocks_per_workgroup.M, cols: compute_block_thread_K_inner_loop_step},
+          loading_point_WGSL_type: input_A_packed_type_WGSL,
+          cache_step_loading_point_row_in_TSG_base_WGSL: '0',
+          cache_step_loading_point_col_in_TSG_base_WGSL: 'cache_step_A_loading_point_col_in_TSG_base',
+          sourceLoadingPointTSGAccessingExpr: (_: string, row_in_TSG: string, col_in_TSG: string) =>
+              getBufferALoadingPointInTSGExpr(row_in_TSG, col_in_TSG),
+          loading_points_prefer_major: 'row',
+        });
+        const BufferBCache: TSGBlockCacheHelper = new VoidCacheHelper({
+          variable_name: 'input_B',
+          threads_per_TSG,
+          loading_points_per_compute_block: loading_points_per_compute_block_B,
+          cache_compute_blocks_per_TSG:
+              {rows: compute_block_thread_K_inner_loop_step, cols: compute_blocks_per_workgroup.N},
+          loading_point_WGSL_type: input_B_packed_type_WGSL,
+          cache_step_loading_point_row_in_TSG_base_WGSL: 'cache_step_B_loading_point_row_in_TSG_base',
+          cache_step_loading_point_col_in_TSG_base_WGSL: '0',
+          sourceLoadingPointTSGAccessingExpr: (/*TSG*/ _: string, row_in_TSG: string, col_in_TSG: string) =>
+              getBufferBLoadingPointInTSGExpr(row_in_TSG, col_in_TSG),
+          loading_points_prefer_major: 'row',
+        });
+
+        const inputABlockLoadingPointsFromCacheExprWGSL: (
+            compute_block_row_in_cache: number|string, compute_block_col_in_cache: number|string) => string[][] =
+            inputBlockLoadingPointsExprWGSLBuilder(
+                loading_points_per_compute_block_A,
+                (row_in_cache: number|string, col_in_cache: number|string) =>
+                    BufferACache.loadingPointAccessingInCacheExpr(row_in_cache, col_in_cache, 'tensor_slice_group'));
+        const inputBBlockLoadingPointsFromCacheExprWGSL: (
+            compute_block_row_in_cache: number|string, compute_block_col_in_cache: number|string) => string[][] =
+            inputBlockLoadingPointsExprWGSLBuilder(
+                loading_points_per_compute_block_B,
+                (row_in_cache: number|string, col_in_cache: number|string) =>
+                    BufferBCache.loadingPointAccessingInCacheExpr(row_in_cache, col_in_cache, 'tensor_slice_group'));
+
 
         // -----------------------------------------------------------------------------
         //   Shader code template
@@ -1027,6 +1350,13 @@ const compute_block_shape_N = ${compute_block_shape.N}u;
 const compute_blocks_per_workgroup_M = ${compute_blocks_per_workgroup.M}u;
 const compute_blocks_per_workgroup_K = ${compute_blocks_per_workgroup.K}u;
 const compute_blocks_per_workgroup_N = ${compute_blocks_per_workgroup.N}u;
+
+const A_loading_point_rows_per_compute_block = ${loading_points_per_compute_block_A.rows}u;
+const A_loading_point_cols_per_compute_block = ${loading_points_per_compute_block_A.cols}u;
+const B_loading_point_rows_per_compute_block = ${loading_points_per_compute_block_B.rows}u;
+const B_loading_point_cols_per_compute_block = ${loading_points_per_compute_block_B.cols}u;
+const Output_loading_point_rows_per_compute_block = ${loading_points_per_compute_block_Output.rows}u;
+const Output_loading_point_cols_per_compute_block = ${loading_points_per_compute_block_Output.cols}u;
 
 const threads_along_M_per_TSG = ${threads_along_M_per_TSG}u;
 const threads_along_N_per_TSG = ${threads_along_N_per_TSG}u;
@@ -1056,8 +1386,26 @@ var<workgroup> tensor_slice_acc: array<array<array<ComputeBlockOutputType, compu
 ` :
                                       ''}
 
+// Invocation scope variables
+var<private> tensor_slice_group: u32;
+var<private> thread_M_in_TSG: u32;
+var<private> thread_N_in_TSG: u32;
+var<private> batch_output: u32;
+var<private> batch_A: u32;
+var<private> batch_B: u32;
+var<private> loading_point_A_TSG_global_row_base: u32;
+var<private> loading_point_A_TSG_global_col_base: u32;
+var<private> loading_point_B_TSG_global_row_base: u32;
+var<private> loading_point_B_TSG_global_col_base: u32;
+var<private> loading_point_Output_TSG_global_row_base: u32;
+var<private> loading_point_Output_TSG_global_col_base: u32;
+
 // Helper functions
 ${[...helper_functions.values()].join('\n\n')}
+
+// Buffer cache global definition, if any
+${BufferACache.cacheMemoryModuleDefinitionWGSL()}
+${BufferBCache.cacheMemoryModuleDefinitionWGSL()}
 
 @compute @workgroup_size(WGS, 1, 1)
 fn main(
@@ -1067,25 +1415,39 @@ fn main(
     let compute_blocks_workgroup_global_base_M = wid.x * compute_blocks_per_workgroup_M;
     // compute_blocks_workgroup_global_base_K == 0
     let compute_blocks_workgroup_global_base_N = wid.y * compute_blocks_per_workgroup_N;
-    let batch_output = wid.z;
+    batch_output = wid.z;
     let input_batches = ConvertOutputBatchToInputBatch(batch_output);
-    let batch_A = i32(input_batches.x);
-    let batch_B = i32(input_batches.y);
+    batch_A = input_batches.x;
+    batch_B = input_batches.y;
 
     let thread_id_in_workgroup = lid.x;
-    let tensor_slice_group = ${tensor_slice_factor === 1 ? '0u' : 'thread_id_in_workgroup / threads_per_TSG'};
+    tensor_slice_group = ${tensor_slice_factor === 1 ? '0u' : 'thread_id_in_workgroup / threads_per_TSG'};
     let thread_id_in_TSG = ${
             tensor_slice_factor === 1 ? 'thread_id_in_workgroup' : 'thread_id_in_workgroup % threads_per_TSG'};
     // Threads arranged in M major manner within a TSG, could also be N major.
     const threads_within_TSG_major_M_not_N = true;
-    let thread_M_in_TSG = select(thread_id_in_TSG / threads_along_N_per_TSG, thread_id_in_TSG % threads_along_M_per_TSG, threads_within_TSG_major_M_not_N);
-    let thread_N_in_TSG = select(thread_id_in_TSG % threads_along_N_per_TSG, thread_id_in_TSG / threads_along_M_per_TSG, threads_within_TSG_major_M_not_N);
+    thread_M_in_TSG = select(thread_id_in_TSG / threads_along_N_per_TSG, thread_id_in_TSG % threads_along_M_per_TSG, threads_within_TSG_major_M_not_N);
+    thread_N_in_TSG = select(thread_id_in_TSG % threads_along_N_per_TSG, thread_id_in_TSG / threads_along_M_per_TSG, threads_within_TSG_major_M_not_N);
 
-    let compute_blocks_thread_workgroup_base_M = thread_M_in_TSG * compute_blocks_per_thread_M;
-    let compute_blocks_thread_workgroup_base_K = tensor_slice_group * compute_blocks_per_thread_K;
-    let compute_blocks_thread_workgroup_base_N = thread_N_in_TSG * compute_blocks_per_thread_N;
+    loading_point_A_TSG_global_row_base = compute_blocks_workgroup_global_base_M * A_loading_point_rows_per_compute_block;
+    loading_point_A_TSG_global_col_base = tensor_slice_group * compute_blocks_per_thread_K * A_loading_point_cols_per_compute_block;
+    loading_point_B_TSG_global_row_base = tensor_slice_group * compute_blocks_per_thread_K * B_loading_point_rows_per_compute_block;
+    loading_point_B_TSG_global_col_base = compute_blocks_workgroup_global_base_N * B_loading_point_cols_per_compute_block;
+    loading_point_Output_TSG_global_row_base = compute_blocks_workgroup_global_base_M * Output_loading_point_rows_per_compute_block;
+    loading_point_Output_TSG_global_col_base = compute_blocks_workgroup_global_base_N * Output_loading_point_cols_per_compute_block;
+
+    let compute_blocks_thread_TSG_base_M = thread_M_in_TSG * compute_blocks_per_thread_M;
+    // Dimension K is unbiased from thread to TSG
+    const compute_blocks_thread_TSG_base_K = 0;
+    let compute_blocks_thread_TSG_base_N = thread_N_in_TSG * compute_blocks_per_thread_N;
+
+    let compute_blocks_TSG_workgroup_base_K = tensor_slice_group * compute_blocks_per_thread_K;
 
     var acc_array: array<array<ComputeBlockOutputType, compute_blocks_per_thread_N>, compute_blocks_per_thread_M>;
+
+    // Buffer cache function-scope definition, if any
+    ${BufferACache.cacheMemoryFunctionDefinitionWGSL()}
+    ${BufferBCache.cacheMemoryFunctionDefinitionWGSL()}
 
     const compute_block_thread_K_inner_loop_step: u32 = ${compute_block_thread_K_inner_loop_step};
 
@@ -1094,23 +1456,52 @@ fn main(
         compute_block_thread_K_outer_loop < compute_blocks_per_thread_K;
         compute_block_thread_K_outer_loop += compute_block_thread_K_inner_loop_step
     ) {
-        // Cache steps along K should be handled here.
-        for (var compute_block_thread_M: u32 = 0; compute_block_thread_M < compute_blocks_per_thread_M; compute_block_thread_M++) {
-            for (var compute_block_thread_N: u32 = 0; compute_block_thread_N < compute_blocks_per_thread_N; compute_block_thread_N++) {
+        // Handle cache steps along K, if any
+        let cache_step_A_loading_point_col_in_TSG_base = i32(compute_block_thread_K_outer_loop) * ${
+            loading_points_per_compute_block_A.cols};
+        let cache_step_B_loading_point_row_in_TSG_base = i32(compute_block_thread_K_outer_loop) * ${
+            loading_points_per_compute_block_B.rows};
+        ${BufferACache.cacheMemoryUpdateStatsWGSL()}
+        ${BufferBCache.cacheMemoryUpdateStatsWGSL()}
+
+        ${
+            u32LoopUpFrom0WGSL(
+                'outer_spatial_loop',
+                (spatial_loop_order === 'M_outer' ? compute_blocks_per_thread_M : compute_blocks_per_thread_N),
+                (outer_spatial_var_or_loop: string|number) => `
+            // Begin of outer spatial loop
+            ${typeof outer_spatial_var_or_loop === 'number' ? 'const' : 'let'} compute_block_thread_${
+                    outer_spatial_dim} = ${outer_spatial_var_or_loop};
+            let compute_block_${outer_spatial_dim}_TSG_biased = compute_block_thread_${
+                    outer_spatial_dim} + compute_blocks_thread_TSG_base_${outer_spatial_dim};
+            // let compute_block_${outer_spatial_dim}_global_biased = compute_block_thread_${
+                    outer_spatial_dim} + compute_blocks_thread_TSG_base_${
+                    outer_spatial_dim} + compute_blocks_workgroup_global_base_${outer_spatial_dim};
+            ${
+                    u32LoopUpFrom0WGSL(
+                        'inner_spatial_loop',
+                        (spatial_loop_order === 'M_outer' ? compute_blocks_per_thread_N : compute_blocks_per_thread_M),
+                        (inner_spatial_var_or_loop: string|number) => `
+                // Begin of inner spatial loop
+                ${typeof inner_spatial_var_or_loop === 'number' ? 'const' : 'let'} compute_block_thread_${
+                            inner_spatial_dim} = ${inner_spatial_var_or_loop};
+                let compute_block_${inner_spatial_dim}_TSG_biased = compute_block_thread_${
+                            inner_spatial_dim} + compute_blocks_thread_TSG_base_${inner_spatial_dim};
+                // let compute_block_${inner_spatial_dim}_global_biased = compute_block_thread_${
+                            inner_spatial_dim} + compute_blocks_thread_TSG_base_${
+                            inner_spatial_dim} + compute_blocks_workgroup_global_base_${inner_spatial_dim};
+
                 let acc: ptr<function, ComputeBlockOutputType> = &acc_array[compute_block_thread_M][compute_block_thread_N];
-                let compute_block_M_workgroup_biased = compute_block_thread_M + compute_blocks_thread_workgroup_base_M;
-                let compute_block_N_workgroup_biased = compute_block_thread_N + compute_blocks_thread_workgroup_base_N;
-                let compute_block_M_global_biased = compute_block_thread_M + compute_blocks_thread_workgroup_base_M + compute_blocks_workgroup_global_base_M;
-                let compute_block_N_global_biased = compute_block_thread_N + compute_blocks_thread_workgroup_base_N + compute_blocks_workgroup_global_base_N;
 
                 ${
-            u32LoopUpFrom0WGSL(
-                'compute_block_thread_K_inner_loop', compute_block_thread_K_inner_loop_step,
-                (compute_block_thread_K_inner_loop_var_or_value) => `
+                            u32LoopUpFrom0WGSL(
+                                'compute_block_thread_K_inner_loop', compute_block_thread_K_inner_loop_step,
+                                (compute_block_thread_K_inner_loop_var_or_value) => `
+                    // Begin of compute_block_thread_K_inner_loop loop
                     let compute_block_thread_K = compute_block_thread_K_outer_loop + ${
-                    compute_block_thread_K_inner_loop_var_or_value};
+                                    compute_block_thread_K_inner_loop_var_or_value};
                     // compute_block_K is unbiased from workgroup to global
-                    let compute_block_K_global_biased = compute_block_thread_K + compute_blocks_thread_workgroup_base_K;
+                    let compute_block_K_global_biased = compute_block_thread_K + compute_blocks_thread_TSG_base_K;
                     /*
                     Handle compute block:
                         let input_A_block = loadABlock(compute_block_M_biased, compute_block_K_biased, compute_block_N_biased);
@@ -1119,31 +1510,48 @@ fn main(
                     */
                     // Load A input block from LLC/memory
                     var compute_block_input_A: array<array<${input_A_packed_type_WGSL}, ${
-                    loading_points_per_compute_block_A.cols}>, ${loading_points_per_compute_block_A.rows}>;
+                                    loading_points_per_compute_block_A.cols}>, ${
+                                    loading_points_per_compute_block_A.rows}>;
                     ${
-                    loadInputABlockFromBufferStats(
-                        'compute_block_M_global_biased', 'compute_block_K_global_biased', 'compute_block_input_A', 20)}
+                                    assignLoadingPointsToTargetStats(
+                                        'compute_block_input_A',
+                                        inputABlockLoadingPointsFromCacheExprWGSL(
+                                            'compute_block_M_TSG_biased',
+                                            compute_block_thread_K_inner_loop_var_or_value),
+                                        20)}
                     // Load B input block from LLC/memory
                     var compute_block_input_B: array<array<${input_B_packed_type_WGSL}, ${
-                    loading_points_per_compute_block_B.cols}>, ${loading_points_per_compute_block_B.rows}>;
+                                    loading_points_per_compute_block_B.cols}>, ${
+                                    loading_points_per_compute_block_B.rows}>;
                     ${
-                    loadInputBBlockFromBufferStats(
-                        'compute_block_K_global_biased', 'compute_block_N_global_biased', 'compute_block_input_B', 20)}
+                                    assignLoadingPointsToTargetStats(
+                                        'compute_block_input_B',
+                                        inputBBlockLoadingPointsFromCacheExprWGSL(
+                                            compute_block_thread_K_inner_loop_var_or_value,
+                                            'compute_block_N_TSG_biased'),
+                                        20)}
+
                     // Compute block
                     ${
-                    calcComputeBlockStats(
-                        Array.from({length: loading_points_per_compute_block_A.rows})
-                            .map(
-                                (_, row) => Array.from({length: loading_points_per_compute_block_A.cols})
-                                                .map((_, col) => `compute_block_input_A[${row}][${col}]`)),
-                        Array.from({length: loading_points_per_compute_block_B.rows})
-                            .map(
-                                (_, row) => Array.from({length: loading_points_per_compute_block_B.cols})
-                                                .map((_, col) => `compute_block_input_B[${row}][${col}]`)),
-                        '(*acc)', 0, 0, compute_schema)}
-`)}
-            }
-        }
+                                    calcComputeBlockStats(
+                                        Array.from({length: loading_points_per_compute_block_A.rows})
+                                            .map(
+                                                (_, row) =>
+                                                    Array.from({length: loading_points_per_compute_block_A.cols})
+                                                        .map((_, col) => `compute_block_input_A[${row}][${col}]`)),
+                                        Array.from({length: loading_points_per_compute_block_B.rows})
+                                            .map(
+                                                (_, row) =>
+                                                    Array.from({length: loading_points_per_compute_block_B.cols})
+                                                        .map((_, col) => `compute_block_input_B[${row}][${col}]`)),
+                                        '(*acc)', 0, 0, compute_schema)}
+
+                    // End of compute_block_thread_K_inner_loop loop`,
+                                false, 16)}
+                // End of inner spatial loop`,
+                        !unfold_spatial_loop, 12)}
+            // End of outer spatial loop`,
+                !unfold_spatial_loop, 8)}
     }
 
 
@@ -1163,8 +1571,8 @@ fn main(
                 let reg_acc = &acc_array[compute_block_thread_M][compute_block_thread_N];
                 tensor_slice_acc
                     [tensor_slice_group-${Math.ceil(remaining_slices / 2)}]
-                    [compute_blocks_thread_workgroup_base_M+compute_block_thread_M]
-                    [compute_blocks_thread_workgroup_base_N+compute_block_thread_N] =
+                    [compute_blocks_thread_TSG_base_M+compute_block_thread_M]
+                    [compute_blocks_thread_TSG_base_N+compute_block_thread_N] =
                     *reg_acc;
             }
         }
@@ -1177,8 +1585,8 @@ fn main(
                 let workgroup_acc =
                       &tensor_slice_acc
                           [tensor_slice_group]
-                          [compute_blocks_thread_workgroup_base_M+compute_block_thread_M]
-                          [compute_blocks_thread_workgroup_base_N+compute_block_thread_N];
+                          [compute_blocks_thread_TSG_base_M+compute_block_thread_M]
+                          [compute_blocks_thread_TSG_base_N+compute_block_thread_N];
                 let reg_acc = &acc_array[compute_block_thread_M][compute_block_thread_N];
                 ${addIdent(addOutputBlocksStats('(*reg_acc)', '(*workgroup_acc)'), 16, 'keepFirstLine')}
             }
@@ -1226,7 +1634,8 @@ fn main(
   return {
     name: 'MatMulTemplatedTrival',
     shaderCache: {
-      // hint: `${activation.activation};${Object.entries(workgroup_params).map((entry) => entry.join(':')).join(';')};`,
+      // hint: `${activation.activation};${Object.entries(workgroup_params).map((entry) =>
+      // entry.join(':')).join(';')};`,
       hint: `${Object.entries(cacheKey).map((entry) => entry.map(x => JSON.stringify(x)).join(':')).join(';')};`,
       inputDependencies: has_bias ? ['rank', 'rank', 'rank'] : ['rank', 'rank']
     },
@@ -1283,7 +1692,7 @@ input A batches ${batchAggregatedInputs[0].dims[0]} * input B batches ${batchAgg
           cols: loading_points_layout === 'NHW' ? aggregated_tensor_dims[2] : aggregated_tensor_dims[1],
           type: tensor_data_type === DataType.float ? 'f32' : 'f16',
           buffer_layout: {
-            packed_vector_direction: loading_points_layout === 'NHW' ? 'row':'col',
+            packed_vector_direction: loading_points_layout === 'NHW' ? 'row' : 'col',
             packed_vector_size,
             loading_points_layout,
             // Buffer accessing: buffer_variable[batch][inner][outer] of packed type
@@ -1323,11 +1732,12 @@ input A batches ${batchAggregatedInputs[0].dims[0]} * input B batches ${batchAgg
       };
 
       const schedule_params: ShaderScheduleSchemaParameters = {
-        compute_schema: 'scaledVector',
-        // compute_schema: 'dotProduct',
+        // compute_schema: 'scaledVector',
+        compute_schema: 'dotProduct',
         tensor_slice: {
           // tensor_slice_factor: 1,
-          tensor_slice_factor: 4,
+          // tensor_slice_factor: 4,
+          tensor_slice_factor: 2,
           tensor_slice_input_policy: 'continious',
         },
       };
