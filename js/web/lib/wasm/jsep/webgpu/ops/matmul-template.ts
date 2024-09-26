@@ -89,7 +89,7 @@ type ScheduleSchemaSubgroupsParameters =
 type ScheduleSchemaTensorSliceParameters = {
   tensor_slice_factor: number;
   // How to divide the input A and B along K dimension
-  tensor_slice_input_policy: 'continious' | 'interleaved';
+  // tensor_slice_input_policy: 'continious' | 'interleaved';
 };
 
 type ShaderScheduleSchemaParameters = {
@@ -700,9 +700,10 @@ dividable by compute_block_shape ${PrintMKN(compute_block_shape)}`);
   // -----------------------------------------------------------------------------
   // TODO: Should be decided by schedule.
   const spatial_loop_order: 'M_outer'|'N_outer' = 'M_outer';
-  const outer_spatial_dim = spatial_loop_order === 'M_outer' ? 'M' : 'N';
-  const inner_spatial_dim = spatial_loop_order === 'M_outer' ? 'N' : 'M';
+  // const outer_spatial_dim = spatial_loop_order === 'M_outer' ? 'M' : 'N';
+  // const inner_spatial_dim = spatial_loop_order === 'M_outer' ? 'N' : 'M';
   const unfold_spatial_loop: boolean = false;
+  const unfold_K_inner_loop: boolean = false;
   // const compute_block_thread_K_inner_loop_step: number|string = 1;
   const compute_block_thread_K_inner_loop_step: number|string = 2;
   assert(
@@ -1084,49 +1085,6 @@ fn ${function_name}(value: ${packed_type_in_buffer_WGSL}, loading_point_row: i32
               ident, 'keepFirstLine');
         };
 
-        /*
-        // Load all loading points of a input block from given position without bias, the base can be added in the
-        // position or in the loading point accessor
-        const loadInputBlockStatsBuilder = (
-            loading_points_per_compute_block: RowsColsSpan,
-            loadingPointAccessorExpr: (loading_point_row: number|string, loading_point_col: number|string) => string,
-            ) =>
-            ((
-                 compute_block_position_row: number|string,
-                 compute_block_position_col: number|string,
-                 loading_target_WGSL: string|string[][],
-                 ident: number = 0,
-                 ): string => {
-              const loading_point_row_base = (typeof compute_block_position_row === 'number') ?
-                  compute_block_position_row * loading_points_per_compute_block.rows :
-                  `(${compute_block_position_row} * ${loading_points_per_compute_block.rows})`;
-              const loading_point_col_base = (typeof compute_block_position_col === 'number') ?
-                  compute_block_position_col * loading_points_per_compute_block.cols :
-                  `(${compute_block_position_col} * ${loading_points_per_compute_block.cols})`;
-              return addIdent(
-                  arrayMap(
-                      loading_points_per_compute_block.rows,
-                      (row) =>
-                          arrayMap(
-                              loading_points_per_compute_block.cols,
-                              (col) => `${
-                                  typeof loading_target_WGSL === 'string' ? `${loading_target_WGSL}[${row}][${col}]` :
-                                                                            loading_target_WGSL[row][col]} = \
-${loadingPointAccessorExpr(`i32(${loading_point_row_base} + ${row})`, `i32(${loading_point_col_base} + ${col})`)};`)
-                              .join('\n'))
-                      .join('\n'),
-                  ident, 'keepFirstLine');
-            });
-        const loadInputABlockFromBufferStats =
-            loadInputBlockStatsBuilder(loading_points_per_compute_block_A, callBufferALoadingFunctionExpr);
-        const loadInputBBlockFromBufferStats =
-            loadInputBlockStatsBuilder(loading_points_per_compute_block_B, callBufferBLoadingFunctionExpr);
-        const loadInputABlockInTSGFromBufferStats =
-            loadInputBlockStatsBuilder(loading_points_per_compute_block_A, getBufferALoadingPointInTSGExpr);
-        const loadInputBBlockInTSGFromBufferStats =
-            loadInputBlockStatsBuilder(loading_points_per_compute_block_B, getBufferBLoadingPointInTSGExpr);
-        */
-
         // Using vectorized computation statements to compute a single compute block
         const calcComputeBlockStats = (
             inputAVectorWGSLs: string[/* row groups */][/* col groups */],
@@ -1333,6 +1291,158 @@ ${
 
 
         // -----------------------------------------------------------------------------
+        //   Nesting compute loops
+        // -----------------------------------------------------------------------------
+        const nesting_compute_loop_valid_loop_var_names =
+            ['compute_block_thread_M', 'compute_block_thread_N', 'compute_block_thread_K_inner'] as const;
+        type NestingComputeLoopValidLoopVarName = typeof nesting_compute_loop_valid_loop_var_names[number];
+        type NestingComputeLoopValidLoopVarsOrValues = {[K in NestingComputeLoopValidLoopVarName]?: string | number};
+        interface NestingComputeLoop {
+          loop_var_name_WGSL: NestingComputeLoopValidLoopVarName;
+          loop_upper_boundary: string|number;
+          loop_body_before_inner_loop: (valid_loop_vars_or_values: NestingComputeLoopValidLoopVarsOrValues) => string;
+          loop_body_after_inner_loop: (valid_loop_vars_or_values: NestingComputeLoopValidLoopVarsOrValues) => string;
+          disable_unfold?: boolean;
+          additional_ident_for_inner_loop?: number;
+        }
+        interface NestingComputeLoopDeepestBody {
+          deepest_body: (valid_loop_vars_or_values: NestingComputeLoopValidLoopVarsOrValues) => string;
+        }
+        const buildNestingComputeLoop =
+            (loops: (NestingComputeLoop|NestingComputeLoopDeepestBody)[],
+             valid_loop_vars_or_values: NestingComputeLoopValidLoopVarsOrValues): string => {
+              const current_loop = loops[0];
+              const remain_loops = loops.slice(1);
+              if ('deepest_body' in current_loop) {
+                return current_loop.deepest_body(valid_loop_vars_or_values);
+              }
+              const wrapLoopBodyFunction: () => ((loop_var_or_value: string|number) => string) = () => {
+                return (loop_var_or_value: string|number) => {
+                  const updated_loop_vars_or_values: NestingComputeLoopValidLoopVarsOrValues =
+                      {...valid_loop_vars_or_values, [current_loop.loop_var_name_WGSL]: loop_var_or_value};
+                  const loop_body_before_inner_loop =
+                      current_loop.loop_body_before_inner_loop(updated_loop_vars_or_values);
+                  const loop_body_after_inner_loop =
+                      current_loop.loop_body_after_inner_loop(updated_loop_vars_or_values);
+                  return addIdent(
+                      [
+                        loop_body_before_inner_loop,
+                        addIdent(
+                            buildNestingComputeLoop(remain_loops, updated_loop_vars_or_values),
+                            current_loop.additional_ident_for_inner_loop ?? 0, 'addAllLines'),
+                        loop_body_after_inner_loop
+                      ].join(''),
+                      4, 'addAllLines');
+                }
+              };
+              return u32LoopUpFrom0WGSL(
+                  current_loop.loop_var_name_WGSL, current_loop.loop_upper_boundary, wrapLoopBodyFunction(),
+                  current_loop.disable_unfold);
+            };
+
+        const compute_block_thread_K_inner_loop: NestingComputeLoop = {
+          loop_var_name_WGSL: 'compute_block_thread_K_inner',
+          loop_upper_boundary: compute_block_thread_K_inner_loop_step,
+          loop_body_before_inner_loop: (valid_loop_vars_or_values: NestingComputeLoopValidLoopVarsOrValues) => `
+// Begin of compute_block_thread_K_inner loop${
+              typeof valid_loop_vars_or_values.compute_block_thread_K_inner === 'number' ?
+                  `, step ${valid_loop_vars_or_values.compute_block_thread_K_inner} of ${
+                      compute_block_thread_K_inner_loop_step}` :
+                  ''}
+// Compute block K is unbiased from thread to TSG
+let compute_block_thread_K_in_TSG = compute_block_thread_K_outer_loop + ${
+              valid_loop_vars_or_values.compute_block_thread_K_inner!};
+// Compute block K is unbiased from workgroup to global
+let compute_block_K_global_biased = compute_block_thread_K_in_TSG + compute_blocks_TSG_workgroup_base_K;
+if (compute_block_thread_K_in_TSG < compute_blocks_per_thread_K) {
+`,
+          loop_body_after_inner_loop: () => `
+    // End of condition (compute_block_thread_K_in_TSG < compute_blocks_per_thread_K)
+}
+// End of compute_block_thread_K_inner loop`,
+          disable_unfold: !unfold_K_inner_loop,
+          additional_ident_for_inner_loop: 4,
+        };
+
+        const compute_block_thread_M_loop: NestingComputeLoop = {
+          loop_var_name_WGSL: 'compute_block_thread_M',
+          loop_upper_boundary: compute_blocks_per_thread_M,
+          loop_body_before_inner_loop: (valid_loop_vars_or_values: NestingComputeLoopValidLoopVarsOrValues) => `
+// Begin of compute_block_thread_M loop${
+              typeof valid_loop_vars_or_values.compute_block_thread_M === 'number' ?
+                  `, step ${valid_loop_vars_or_values.compute_block_thread_M} of ${compute_blocks_per_thread_M}` :
+                  ''}
+let compute_block_M_TSG_biased = ${
+              valid_loop_vars_or_values.compute_block_thread_M!} + compute_blocks_thread_TSG_base_M;
+// Load A input block from LLC/memory
+var compute_block_input_A: array<array<${input_A_packed_type_WGSL}, ${loading_points_per_compute_block_A.cols}>, ${
+              loading_points_per_compute_block_A.rows}>;
+${
+              assignLoadingPointsToTargetStats(
+                  'compute_block_input_A',
+                  inputABlockLoadingPointsFromCacheExprWGSL(
+                      'compute_block_M_TSG_biased', valid_loop_vars_or_values.compute_block_thread_K_inner!),
+                  0)}
+`,
+          loop_body_after_inner_loop: () => `
+// End of compute_block_thread_M loop`,
+          disable_unfold: !unfold_spatial_loop,
+        };
+
+        const compute_block_thread_N_loop: NestingComputeLoop = {
+          loop_var_name_WGSL: 'compute_block_thread_N',
+          loop_upper_boundary: compute_blocks_per_thread_N,
+          loop_body_before_inner_loop: (valid_loop_vars_or_values: NestingComputeLoopValidLoopVarsOrValues) => `
+// Begin of compute_block_thread_N loop${
+              typeof valid_loop_vars_or_values.compute_block_thread_N === 'number' ?
+                  `, step ${valid_loop_vars_or_values.compute_block_thread_N} of ${compute_blocks_per_thread_N}` :
+                  ''}
+let compute_block_N_TSG_biased = ${
+              valid_loop_vars_or_values.compute_block_thread_N!} + compute_blocks_thread_TSG_base_N;
+// Load B input block from LLC/memory
+var compute_block_input_B: array<array<${input_B_packed_type_WGSL}, ${loading_points_per_compute_block_B.cols}>, ${
+              loading_points_per_compute_block_B.rows}>;
+${
+              assignLoadingPointsToTargetStats(
+                  'compute_block_input_B',
+                  inputBBlockLoadingPointsFromCacheExprWGSL(
+                      valid_loop_vars_or_values.compute_block_thread_K_inner!, 'compute_block_N_TSG_biased'),
+                  0)}
+`,
+          loop_body_after_inner_loop: () => `
+// End of compute_block_thread_N loop`,
+          disable_unfold: !unfold_spatial_loop,
+        };
+
+        const compute_loop_deepest_body: NestingComputeLoopDeepestBody = {
+          deepest_body: (valid_loop_vars_or_values: NestingComputeLoopValidLoopVarsOrValues) => `
+let acc = \
+&acc_array[${valid_loop_vars_or_values.compute_block_thread_M}][${valid_loop_vars_or_values.compute_block_thread_N}];
+
+// Compute block
+${
+              calcComputeBlockStats(
+                  Array.from({length: loading_points_per_compute_block_A.rows})
+                      .map(
+                          (_, row) => Array.from({length: loading_points_per_compute_block_A.cols})
+                                          .map((_, col) => `compute_block_input_A[${row}][${col}]`)),
+                  Array.from({length: loading_points_per_compute_block_B.rows})
+                      .map(
+                          (_, row) => Array.from({length: loading_points_per_compute_block_B.cols})
+                                          .map((_, col) => `compute_block_input_B[${row}][${col}]`)),
+                  '(*acc)', 0, 0, compute_schema)}
+`
+        };
+
+        const nesting_compute_loops: (NestingComputeLoop|NestingComputeLoopDeepestBody)[] = [
+          compute_block_thread_K_inner_loop,
+          ...(spatial_loop_order === 'M_outer' ? [compute_block_thread_M_loop, compute_block_thread_N_loop] :
+                                                 [compute_block_thread_N_loop, compute_block_thread_M_loop]),
+          compute_loop_deepest_body
+        ];
+
+
+        // -----------------------------------------------------------------------------
         //   Shader code template
         // -----------------------------------------------------------------------------
         const shader = `
@@ -1378,14 +1488,6 @@ alias ComputeBlockOutputType = ${compute_block_output_type_WGSL};
 
 ${shader_helper.registerUniforms(uniforms_WGSL_info).declareVariables(...input_variables, output_variable)}
 
-${
-            tensor_slice_factor > 1 ? `
-// Shared memory for adding up tensor sliced results
-var<workgroup> tensor_slice_acc: array<array<array<ComputeBlockOutputType, compute_blocks_per_workgroup_N>, compute_blocks_per_workgroup_M>, ${
-                                          Math.ceil(tensor_slice_factor / 2)}>;
-` :
-                                      ''}
-
 // Invocation scope variables
 var<private> tensor_slice_group: u32;
 var<private> thread_M_in_TSG: u32;
@@ -1393,6 +1495,10 @@ var<private> thread_N_in_TSG: u32;
 var<private> batch_output: u32;
 var<private> batch_A: u32;
 var<private> batch_B: u32;
+var<private> compute_blocks_thread_TSG_base_M: u32;
+// Dimension K is unbiased from thread to TSG
+// const compute_blocks_thread_TSG_base_K = 0;
+var<private> compute_blocks_thread_TSG_base_N: u32;
 var<private> loading_point_A_TSG_global_row_base: u32;
 var<private> loading_point_A_TSG_global_col_base: u32;
 var<private> loading_point_B_TSG_global_row_base: u32;
@@ -1400,8 +1506,52 @@ var<private> loading_point_B_TSG_global_col_base: u32;
 var<private> loading_point_Output_TSG_global_row_base: u32;
 var<private> loading_point_Output_TSG_global_col_base: u32;
 
+var<private> acc_array: array<array<ComputeBlockOutputType, compute_blocks_per_thread_N>, compute_blocks_per_thread_M>;
+
 // Helper functions
 ${[...helper_functions.values()].join('\n\n')}
+
+${
+            tensor_slice_factor > 1 ? `
+// Shared memory for adding up tensor sliced results
+var<workgroup> tensor_slice_acc: array<array<array<ComputeBlockOutputType, compute_blocks_per_workgroup_N>, compute_blocks_per_workgroup_M>, ${
+                                          Math.ceil(tensor_slice_factor / 2)}>;
+
+// Helper function for adding up tensor slice results
+fn TensorSliceResultsMergingStep(remaining_slices: u32) {
+    let half_slices = (remaining_slices+1) / 2;  // ceil(remaining_slices / 2)
+    // Sub-step A: Store upper-half reg to lower-half SM
+    if ((tensor_slice_group < remaining_slices) && (tensor_slice_group >= half_slices)) {
+        for (var compute_block_thread_M: u32 = 0; compute_block_thread_M < compute_blocks_per_thread_M; compute_block_thread_M++) {
+            for (var compute_block_thread_N: u32 = 0; compute_block_thread_N < compute_blocks_per_thread_N; compute_block_thread_N++) {
+                let reg_acc = &acc_array[compute_block_thread_M][compute_block_thread_N];
+                tensor_slice_acc
+                    [tensor_slice_group-half_slices]
+                    [compute_blocks_thread_TSG_base_M+compute_block_thread_M]
+                    [compute_blocks_thread_TSG_base_N+compute_block_thread_N] =
+                    *reg_acc;
+            }
+        }
+    }
+    workgroupBarrier();
+    // Sub-step B: Lower-half add SM into reg
+    if (tensor_slice_group < half_slices) {
+        for (var compute_block_thread_M: u32 = 0; compute_block_thread_M < compute_blocks_per_thread_M; compute_block_thread_M++) {
+            for (var compute_block_thread_N: u32 = 0; compute_block_thread_N < compute_blocks_per_thread_N; compute_block_thread_N++) {
+                let workgroup_acc =
+                      &tensor_slice_acc
+                          [tensor_slice_group]
+                          [compute_blocks_thread_TSG_base_M+compute_block_thread_M]
+                          [compute_blocks_thread_TSG_base_N+compute_block_thread_N];
+                let reg_acc = &acc_array[compute_block_thread_M][compute_block_thread_N];
+                ${addIdent(addOutputBlocksStats('(*reg_acc)', '(*workgroup_acc)'), 16, 'keepFirstLine')}
+            }
+        }
+    }
+    workgroupBarrier();
+}
+` :
+                                      ''}
 
 // Buffer cache global definition, if any
 ${BufferACache.cacheMemoryModuleDefinitionWGSL()}
@@ -1436,14 +1586,10 @@ fn main(
     loading_point_Output_TSG_global_row_base = compute_blocks_workgroup_global_base_M * Output_loading_point_rows_per_compute_block;
     loading_point_Output_TSG_global_col_base = compute_blocks_workgroup_global_base_N * Output_loading_point_cols_per_compute_block;
 
-    let compute_blocks_thread_TSG_base_M = thread_M_in_TSG * compute_blocks_per_thread_M;
-    // Dimension K is unbiased from thread to TSG
-    const compute_blocks_thread_TSG_base_K = 0;
-    let compute_blocks_thread_TSG_base_N = thread_N_in_TSG * compute_blocks_per_thread_N;
+    compute_blocks_thread_TSG_base_M = thread_M_in_TSG * compute_blocks_per_thread_M;
+    compute_blocks_thread_TSG_base_N = thread_N_in_TSG * compute_blocks_per_thread_N;
 
     let compute_blocks_TSG_workgroup_base_K = tensor_slice_group * compute_blocks_per_thread_K;
-
-    var acc_array: array<array<ComputeBlockOutputType, compute_blocks_per_thread_N>, compute_blocks_per_thread_M>;
 
     // Buffer cache function-scope definition, if any
     ${BufferACache.cacheMemoryFunctionDefinitionWGSL()}
@@ -1464,136 +1610,19 @@ fn main(
         ${BufferACache.cacheMemoryUpdateStatsWGSL()}
         ${BufferBCache.cacheMemoryUpdateStatsWGSL()}
 
-        ${
-            u32LoopUpFrom0WGSL(
-                'outer_spatial_loop',
-                (spatial_loop_order === 'M_outer' ? compute_blocks_per_thread_M : compute_blocks_per_thread_N),
-                (outer_spatial_var_or_loop: string|number) => `
-            // Begin of outer spatial loop
-            ${typeof outer_spatial_var_or_loop === 'number' ? 'const' : 'let'} compute_block_thread_${
-                    outer_spatial_dim} = ${outer_spatial_var_or_loop};
-            let compute_block_${outer_spatial_dim}_TSG_biased = compute_block_thread_${
-                    outer_spatial_dim} + compute_blocks_thread_TSG_base_${outer_spatial_dim};
-            // let compute_block_${outer_spatial_dim}_global_biased = compute_block_thread_${
-                    outer_spatial_dim} + compute_blocks_thread_TSG_base_${
-                    outer_spatial_dim} + compute_blocks_workgroup_global_base_${outer_spatial_dim};
-            ${
-                    u32LoopUpFrom0WGSL(
-                        'inner_spatial_loop',
-                        (spatial_loop_order === 'M_outer' ? compute_blocks_per_thread_N : compute_blocks_per_thread_M),
-                        (inner_spatial_var_or_loop: string|number) => `
-                // Begin of inner spatial loop
-                ${typeof inner_spatial_var_or_loop === 'number' ? 'const' : 'let'} compute_block_thread_${
-                            inner_spatial_dim} = ${inner_spatial_var_or_loop};
-                let compute_block_${inner_spatial_dim}_TSG_biased = compute_block_thread_${
-                            inner_spatial_dim} + compute_blocks_thread_TSG_base_${inner_spatial_dim};
-                // let compute_block_${inner_spatial_dim}_global_biased = compute_block_thread_${
-                            inner_spatial_dim} + compute_blocks_thread_TSG_base_${
-                            inner_spatial_dim} + compute_blocks_workgroup_global_base_${inner_spatial_dim};
-
-                let acc: ptr<function, ComputeBlockOutputType> = &acc_array[compute_block_thread_M][compute_block_thread_N];
-
-                ${
-                            u32LoopUpFrom0WGSL(
-                                'compute_block_thread_K_inner_loop', compute_block_thread_K_inner_loop_step,
-                                (compute_block_thread_K_inner_loop_var_or_value) => `
-                    // Begin of compute_block_thread_K_inner_loop loop
-                    let compute_block_thread_K = compute_block_thread_K_outer_loop + ${
-                                    compute_block_thread_K_inner_loop_var_or_value};
-                    // compute_block_K is unbiased from workgroup to global
-                    let compute_block_K_global_biased = compute_block_thread_K + compute_blocks_thread_TSG_base_K;
-                    /*
-                    Handle compute block:
-                        let input_A_block = loadABlock(compute_block_M_biased, compute_block_K_biased, compute_block_N_biased);
-                        let input_B_block = loadBBlock(compute_block_M_biased, compute_block_K_biased, compute_block_N_biased);
-                        computeBlock(acc, input_A_block, input_B_block);
-                    */
-                    // Load A input block from LLC/memory
-                    var compute_block_input_A: array<array<${input_A_packed_type_WGSL}, ${
-                                    loading_points_per_compute_block_A.cols}>, ${
-                                    loading_points_per_compute_block_A.rows}>;
-                    ${
-                                    assignLoadingPointsToTargetStats(
-                                        'compute_block_input_A',
-                                        inputABlockLoadingPointsFromCacheExprWGSL(
-                                            'compute_block_M_TSG_biased',
-                                            compute_block_thread_K_inner_loop_var_or_value),
-                                        20)}
-                    // Load B input block from LLC/memory
-                    var compute_block_input_B: array<array<${input_B_packed_type_WGSL}, ${
-                                    loading_points_per_compute_block_B.cols}>, ${
-                                    loading_points_per_compute_block_B.rows}>;
-                    ${
-                                    assignLoadingPointsToTargetStats(
-                                        'compute_block_input_B',
-                                        inputBBlockLoadingPointsFromCacheExprWGSL(
-                                            compute_block_thread_K_inner_loop_var_or_value,
-                                            'compute_block_N_TSG_biased'),
-                                        20)}
-
-                    // Compute block
-                    ${
-                                    calcComputeBlockStats(
-                                        Array.from({length: loading_points_per_compute_block_A.rows})
-                                            .map(
-                                                (_, row) =>
-                                                    Array.from({length: loading_points_per_compute_block_A.cols})
-                                                        .map((_, col) => `compute_block_input_A[${row}][${col}]`)),
-                                        Array.from({length: loading_points_per_compute_block_B.rows})
-                                            .map(
-                                                (_, row) =>
-                                                    Array.from({length: loading_points_per_compute_block_B.cols})
-                                                        .map((_, col) => `compute_block_input_B[${row}][${col}]`)),
-                                        '(*acc)', 0, 0, compute_schema)}
-
-                    // End of compute_block_thread_K_inner_loop loop`,
-                                false, 16)}
-                // End of inner spatial loop`,
-                        !unfold_spatial_loop, 12)}
-            // End of outer spatial loop`,
-                !unfold_spatial_loop, 8)}
+        ${addIdent(buildNestingComputeLoop(nesting_compute_loops, {}), 8)}
     }
-
 
     ${
             tensor_slice_factor > 1 ? `
-    // Add up tensor slice results if necessary
+    // Add up tensor slice results
     ${(() => {
               let code = '';
               for (let remaining_slices = tensor_slice_factor; remaining_slices > 1;
                    remaining_slices = Math.ceil(remaining_slices / 2)) {
                 code += `
     // Merge tensor slices ${remaining_slices} -> ${Math.ceil(remaining_slices / 2)}
-    // Sub-step A: Store upper-half reg to lower-half SM
-    if (tensor_slice_group >= ${Math.ceil(remaining_slices / 2)}) {
-        for (var compute_block_thread_M: u32 = 0; compute_block_thread_M < compute_blocks_per_thread_M; compute_block_thread_M++) {
-            for (var compute_block_thread_N: u32 = 0; compute_block_thread_N < compute_blocks_per_thread_N; compute_block_thread_N++) {
-                let reg_acc = &acc_array[compute_block_thread_M][compute_block_thread_N];
-                tensor_slice_acc
-                    [tensor_slice_group-${Math.ceil(remaining_slices / 2)}]
-                    [compute_blocks_thread_TSG_base_M+compute_block_thread_M]
-                    [compute_blocks_thread_TSG_base_N+compute_block_thread_N] =
-                    *reg_acc;
-            }
-        }
-    }
-    workgroupBarrier();
-    // Sub-step B: Lower-half add SM into reg
-    if (tensor_slice_group < ${Math.ceil(remaining_slices / 2)}) {
-        for (var compute_block_thread_M: u32 = 0; compute_block_thread_M < compute_blocks_per_thread_M; compute_block_thread_M++) {
-            for (var compute_block_thread_N: u32 = 0; compute_block_thread_N < compute_blocks_per_thread_N; compute_block_thread_N++) {
-                let workgroup_acc =
-                      &tensor_slice_acc
-                          [tensor_slice_group]
-                          [compute_blocks_thread_TSG_base_M+compute_block_thread_M]
-                          [compute_blocks_thread_TSG_base_N+compute_block_thread_N];
-                let reg_acc = &acc_array[compute_block_thread_M][compute_block_thread_N];
-                ${addIdent(addOutputBlocksStats('(*reg_acc)', '(*workgroup_acc)'), 16, 'keepFirstLine')}
-            }
-        }
-    }
-    workgroupBarrier();
-`;
+    TensorSliceResultsMergingStep(${remaining_slices});`;
               }
               return code;
             })()}
@@ -1736,9 +1765,9 @@ input A batches ${batchAggregatedInputs[0].dims[0]} * input B batches ${batchAgg
         compute_schema: 'dotProduct',
         tensor_slice: {
           // tensor_slice_factor: 1,
-          // tensor_slice_factor: 4,
-          tensor_slice_factor: 2,
-          tensor_slice_input_policy: 'continious',
+          tensor_slice_factor: 4,
+          // tensor_slice_factor: 2,
+          // tensor_slice_input_policy: 'continious',
         },
       };
 
