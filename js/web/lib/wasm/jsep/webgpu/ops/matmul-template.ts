@@ -519,10 +519,10 @@ export class VoidCacheHelper extends TSGBlockCacheHelperBase implements TSGBlock
     return (row_in_cache: string|number, col_in_cache: string|number, TSG: string) => `${
                this.sourceLoadingPointTSGAccessingExpr(
                    TSG,
-                   `(/*row_in_cache*/ ${row_in_cache} + /*cache_step_loading_point_row_in_TSG_base_WGSL*/ ${
-                       this.cache_step_loading_point_row_in_TSG_base_WGSL})`,
-                   `(/*col_in_cache*/ ${col_in_cache} + /*cache_step_loading_point_col_in_TSG_base_WGSL*/ ${
-                       this.cache_step_loading_point_col_in_TSG_base_WGSL})`)}`;
+                   `(/*row_in_cache*/ i32(${row_in_cache}) + /*cache_step_loading_point_row_in_TSG_base_WGSL*/ i32(${
+                       this.cache_step_loading_point_row_in_TSG_base_WGSL}))`,
+                   `(/*col_in_cache*/ i32(${col_in_cache}) + /*cache_step_loading_point_col_in_TSG_base_WGSL*/ i32(${
+                       this.cache_step_loading_point_col_in_TSG_base_WGSL}))`)}`;
   }
 }
 
@@ -590,6 +590,93 @@ var<workgroup> ${this.cache_name}: array<array<array<${this.loading_point_WGSL_t
                `${this.cache_name}[${TSG}][${row_in_cache}][${col_in_cache}]`;
   }
 }
+
+/*
+
+// Get WGSL expression of all loading points of a input block from given position without bias, the bias can be
+// added in the position or in the loading point accessor
+const inputBlockLoadingPointsExprWGSLBuilder = (
+    loading_points_per_compute_block: RowsColsSpan,
+    loadingPointAccessorExpr: (loading_point_row: number|string, loading_point_col: number|string) => string,
+    ) =>
+    ((
+          compute_block_position_row: number|string,
+          compute_block_position_col: number|string,
+          ): string[][] => {
+      const loading_point_row_base = (typeof compute_block_position_row === 'number') ?
+          compute_block_position_row * loading_points_per_compute_block.rows :
+          `(${compute_block_position_row} * ${loading_points_per_compute_block.rows})`;
+      const loading_point_col_base = (typeof compute_block_position_col === 'number') ?
+          compute_block_position_col * loading_points_per_compute_block.cols :
+          `(${compute_block_position_col} * ${loading_points_per_compute_block.cols})`;
+      return (arrayMap(
+          loading_points_per_compute_block.rows,
+          (row) => arrayMap(
+              loading_points_per_compute_block.cols,
+              (col) => loadingPointAccessorExpr(
+                  `i32(${loading_point_row_base} + ${row})`, `i32(${loading_point_col_base} + ${col})`))));
+    });
+*/
+
+interface ComputeLoopInputBlockAccessHelper {
+  inputALoadingPointsPositionsInCacheFromComputeBlockThread(
+      compute_block_thread_M: string|number,
+      compute_block_thread_K_inner: string|number): {row_in_cache: string|number, col_in_cache: string|number}[][];
+  inputBLoadingPointsPositionsInCacheFromComputeBlockThread(
+      compute_block_thread_K_inner: string|number,
+      compute_block_thread_N: string|number): {row_in_cache: string|number, col_in_cache: string|number}[][];
+}
+;
+class ComputeLoopInputBlockAccessHelperBase {
+  loading_points_per_compute_block: RowsColsSpan;
+  constructor(loading_points_per_compute_block: RowsColsSpan) {
+    this.loading_points_per_compute_block = loading_points_per_compute_block;
+  }
+};
+class ComputeLoopInputBlockVoidCacheAccessHelper extends ComputeLoopInputBlockAccessHelperBase implements
+    ComputeLoopInputBlockAccessHelper {
+  constructor(loading_points_per_compute_block: RowsColsSpan) {
+    super(loading_points_per_compute_block);
+  }
+  inputALoadingPointsPositionsInCacheFromComputeBlockThread(
+      compute_block_thread_M: string|number,
+      compute_block_thread_K_inner: string|number): {row_in_cache: string, col_in_cache: string|number}[][] {
+    // Void cache just do the cols K_outer loop bias for accessing loading point for TSG
+    // Row: compute_block_thread_M --(needed)--> loading_point_TSG_M
+    // Col: compute_block_thread_K_inner --(needed)--> loading_point_thread_K_inner --(handled by void cache)-->
+    // loading_point_TSG_K
+    return arrayMap(
+        this.loading_points_per_compute_block.rows,
+        row => arrayMap(
+            this.loading_points_per_compute_block.cols,
+            col => ({
+              row_in_cache: `((${compute_block_thread_M} + compute_blocks_thread_TSG_base_M) * ${
+                  this.loading_points_per_compute_block.rows} + ${row})`,
+              col_in_cache: typeof compute_block_thread_K_inner === 'number' ?
+                  (compute_block_thread_K_inner * this.loading_points_per_compute_block.cols + col) :
+                  `(${compute_block_thread_K_inner} * ${this.loading_points_per_compute_block.cols} + ${col})`,
+            })));
+  };
+  inputBLoadingPointsPositionsInCacheFromComputeBlockThread(
+      compute_block_thread_K_inner: string|number,
+      compute_block_thread_N: string|number): {row_in_cache: string|number, col_in_cache: string|number}[][] {
+    // Void cache just do the rows K_outer loop bias for accessing loading point for TSG
+    // Row: compute_block_thread_K_inner --(needed)--> loading_point_thread_K_inner --(handled by void cache)-->
+    // loading_point_TSG_K Col: compute_block_thread_N --(needed)--> loading_point_TSG_N
+    return arrayMap(
+        this.loading_points_per_compute_block.rows,
+        row => arrayMap(
+            this.loading_points_per_compute_block.cols,
+            col => ({
+              row_in_cache: typeof compute_block_thread_K_inner === 'number' ?
+                  (compute_block_thread_K_inner * this.loading_points_per_compute_block.rows + row) :
+                  `(${compute_block_thread_K_inner} * ${this.loading_points_per_compute_block.rows} + ${row})`,
+              col_in_cache: `((${compute_block_thread_N} + compute_blocks_thread_TSG_base_N) * ${
+                  this.loading_points_per_compute_block.cols} + ${col})`,
+            })));
+  }
+};
+
 
 export function templatedMatMulProgram(
     op_params: GEMMOperationParameters,
@@ -700,10 +787,10 @@ dividable by compute_block_shape ${PrintMKN(compute_block_shape)}`);
   // -----------------------------------------------------------------------------
   // TODO: Should be decided by schedule.
   const spatial_loop_order: 'M_outer'|'N_outer' = 'M_outer';
-  // const outer_spatial_dim = spatial_loop_order === 'M_outer' ? 'M' : 'N';
-  // const inner_spatial_dim = spatial_loop_order === 'M_outer' ? 'N' : 'M';
   const unfold_spatial_loop: boolean = false;
   const unfold_K_inner_loop: boolean = false;
+  const input_A_register_cache_enabled: boolean = true;
+  const input_B_register_cache_enabled: boolean = true;
   // const compute_block_thread_K_inner_loop_step: number|string = 1;
   const compute_block_thread_K_inner_loop_step: number|string = 2;
   assert(
@@ -711,7 +798,7 @@ dividable by compute_block_shape ${PrintMKN(compute_block_shape)}`);
       `Workgroup size ${workgroup_params.threads_per_workgroup} should be a multiple of tensor_slice_factor ${
           tensor_slice_factor}`);
   const threads_per_TSG = workgroup_params.threads_per_workgroup / tensor_slice_factor;
-  const threads_along_M_per_TSG = 16;
+  const threads_along_M_per_TSG = 8;
   assert(
       threads_per_TSG % threads_along_M_per_TSG === 0,
       `threads_per_TSG ${threads_per_TSG} should be a multiple of threads_along_M_per_TSG ${threads_along_M_per_TSG}`);
@@ -1040,30 +1127,6 @@ fn ${function_name}(value: ${packed_type_in_buffer_WGSL}, loading_point_row: i32
             undefined;
         */
 
-        // Get WGSL expression of all loading points of a input block from given position without bias, the bias can be
-        // added in the position or in the loading point accessor
-        const inputBlockLoadingPointsExprWGSLBuilder = (
-            loading_points_per_compute_block: RowsColsSpan,
-            loadingPointAccessorExpr: (loading_point_row: number|string, loading_point_col: number|string) => string,
-            ) =>
-            ((
-                 compute_block_position_row: number|string,
-                 compute_block_position_col: number|string,
-                 ): string[][] => {
-              const loading_point_row_base = (typeof compute_block_position_row === 'number') ?
-                  compute_block_position_row * loading_points_per_compute_block.rows :
-                  `(${compute_block_position_row} * ${loading_points_per_compute_block.rows})`;
-              const loading_point_col_base = (typeof compute_block_position_col === 'number') ?
-                  compute_block_position_col * loading_points_per_compute_block.cols :
-                  `(${compute_block_position_col} * ${loading_points_per_compute_block.cols})`;
-              return (arrayMap(
-                  loading_points_per_compute_block.rows,
-                  (row) => arrayMap(
-                      loading_points_per_compute_block.cols,
-                      (col) => loadingPointAccessorExpr(
-                          `i32(${loading_point_row_base} + ${row})`, `i32(${loading_point_col_base} + ${col})`))));
-            });
-
         // Assign loading points WGSL to a target
         const assignLoadingPointsToTargetStats = (
             loading_target_WGSL: string|string[][],
@@ -1276,6 +1339,37 @@ ${
           loading_points_prefer_major: 'row',
         });
 
+        const compute_loop_input_A_block_access_helper: ComputeLoopInputBlockAccessHelper =
+            new ComputeLoopInputBlockVoidCacheAccessHelper(loading_points_per_compute_block_A);
+        const compute_loop_input_B_block_access_helper: ComputeLoopInputBlockAccessHelper =
+            new ComputeLoopInputBlockVoidCacheAccessHelper(loading_points_per_compute_block_B);
+
+        const inputABlockLoadingPointsFromCacheWithComputeLoopVarOrValueExprWGSL:
+            (compute_block_thread_M_var_or_value: string|number,
+             compute_block_thread_K_inner_var_or_value: string|number) => string[][] =
+                (compute_block_thread_M_var_or_value: string|number,
+                 compute_block_thread_K_inner_var_or_value: string|number) =>
+                    compute_loop_input_A_block_access_helper
+                        .inputALoadingPointsPositionsInCacheFromComputeBlockThread(
+                            compute_block_thread_M_var_or_value, compute_block_thread_K_inner_var_or_value)
+                        .map(
+                            positionsInRow => positionsInRow.map(
+                                position => BufferACache.loadingPointAccessingInCacheExpr(
+                                    position.row_in_cache, position.col_in_cache, 'tensor_slice_group')));
+        const inputBBlockLoadingPointsFromCacheWithComputeLoopVarOrValueExprWGSL:
+            (compute_block_thread_K_inner_var_or_value: string|number,
+             compute_block_thread_N_var_or_value: string|number) => string[][] =
+                (compute_block_thread_K_inner_var_or_value: string|number,
+                 compute_block_thread_N_var_or_value: string|number) =>
+                    compute_loop_input_B_block_access_helper
+                        .inputBLoadingPointsPositionsInCacheFromComputeBlockThread(
+                            compute_block_thread_K_inner_var_or_value, compute_block_thread_N_var_or_value)
+                        .map(
+                            positionsInRow => positionsInRow.map(
+                                position => BufferBCache.loadingPointAccessingInCacheExpr(
+                                    position.row_in_cache, position.col_in_cache, 'tensor_slice_group')));
+
+        /*
         const inputABlockLoadingPointsFromCacheExprWGSL: (
             compute_block_row_in_cache: number|string, compute_block_col_in_cache: number|string) => string[][] =
             inputBlockLoadingPointsExprWGSLBuilder(
@@ -1288,6 +1382,67 @@ ${
                 loading_points_per_compute_block_B,
                 (row_in_cache: number|string, col_in_cache: number|string) =>
                     BufferBCache.loadingPointAccessingInCacheExpr(row_in_cache, col_in_cache, 'tensor_slice_group'));
+        */
+
+        class InputBlockOptionalRegisterCacheHelper {
+          register_cache_enabled: boolean;
+          input_name: string;
+          loading_points_per_compute_block: RowsColsSpan;
+          loading_point_packed_type_WGSL: string;
+
+          register_cache_name: string;
+          cached_loading_points_expr_WGSL: string[][];
+
+          constructor(
+              register_cache_enabled: boolean, input_name: string, loading_points_per_compute_block: RowsColsSpan,
+              loading_point_packed_type_WGSL: string) {
+            this.register_cache_enabled = register_cache_enabled;
+            this.input_name = input_name;
+            this.loading_points_per_compute_block = loading_points_per_compute_block;
+            this.loading_point_packed_type_WGSL = loading_point_packed_type_WGSL;
+
+            this.register_cache_name = `register_cache_compute_block_input_${this.input_name}`;
+          }
+          get defineRegisterCacheWGSL() {
+            return this.register_cache_enabled ?
+                `// Definition of register cache for input ${this.input_name}
+var ${this.register_cache_name}: array<array<${this.loading_point_packed_type_WGSL}, ${
+                    this.loading_points_per_compute_block.cols}>, ${this.loading_points_per_compute_block.rows}>;` :
+                '';
+          }
+          // Always call updateRegisterCache before using cachedLoadingPointsExprWGSL
+          updateRegisterCache(inputBlockLoadingPointsExprWGSL: string[][]) {
+            this.cached_loading_points_expr_WGSL = inputBlockLoadingPointsExprWGSL;
+            assert(
+                this.cached_loading_points_expr_WGSL.length === this.loading_points_per_compute_block.rows,
+                `Expect updating register cache for input ${this.input_name} with ${
+                    this.loading_points_per_compute_block.rows} rows, got ${
+                    this.cached_loading_points_expr_WGSL.length}`);
+            assert(
+                this.cached_loading_points_expr_WGSL[0].length === this.loading_points_per_compute_block.cols,
+                `Expect updating register cache for input ${this.input_name} with ${
+                    this.loading_points_per_compute_block.cols} cols, got ${
+                    this.cached_loading_points_expr_WGSL[0].length}`);
+            return this.register_cache_enabled ?
+                (`// Update register cache for input ${this.input_name}\n` +
+                 assignLoadingPointsToTargetStats(this.register_cache_name, this.cached_loading_points_expr_WGSL)) :
+                '';
+          }
+          get cachedLoadingPointsExprWGSL() {
+            return (
+                this.register_cache_enabled ? arrayMap(
+                                                  this.loading_points_per_compute_block.rows,
+                                                  row => arrayMap(
+                                                      this.loading_points_per_compute_block.cols,
+                                                      col => `${this.register_cache_name}[${row}][${col}]`)) :
+                                              this.cached_loading_points_expr_WGSL);
+          }
+        };
+
+        const InputABlockOptionalRegisterCacheHelper = new InputBlockOptionalRegisterCacheHelper(
+            input_A_register_cache_enabled, 'A', loading_points_per_compute_block_A, input_A_packed_type_WGSL);
+        const InputBBlockOptionalRegisterCacheHelper = new InputBlockOptionalRegisterCacheHelper(
+            input_B_register_cache_enabled, 'B', loading_points_per_compute_block_B, input_B_packed_type_WGSL);
 
 
         // -----------------------------------------------------------------------------
@@ -1374,15 +1529,12 @@ if (compute_block_thread_K_in_TSG < compute_blocks_per_thread_K) {
                   ''}
 let compute_block_M_TSG_biased = ${
               valid_loop_vars_or_values.compute_block_thread_M!} + compute_blocks_thread_TSG_base_M;
-// Load A input block from LLC/memory
-var compute_block_input_A: array<array<${input_A_packed_type_WGSL}, ${loading_points_per_compute_block_A.cols}>, ${
-              loading_points_per_compute_block_A.rows}>;
+${InputABlockOptionalRegisterCacheHelper.defineRegisterCacheWGSL}
 ${
-              assignLoadingPointsToTargetStats(
-                  'compute_block_input_A',
-                  inputABlockLoadingPointsFromCacheExprWGSL(
-                      'compute_block_M_TSG_biased', valid_loop_vars_or_values.compute_block_thread_K_inner!),
-                  0)}
+              InputABlockOptionalRegisterCacheHelper.updateRegisterCache(
+                  inputABlockLoadingPointsFromCacheWithComputeLoopVarOrValueExprWGSL(
+                      valid_loop_vars_or_values.compute_block_thread_M!,
+                      valid_loop_vars_or_values.compute_block_thread_K_inner!))}
 `,
           loop_body_after_inner_loop: () => `
 // End of compute_block_thread_M loop`,
@@ -1399,15 +1551,12 @@ ${
                   ''}
 let compute_block_N_TSG_biased = ${
               valid_loop_vars_or_values.compute_block_thread_N!} + compute_blocks_thread_TSG_base_N;
-// Load B input block from LLC/memory
-var compute_block_input_B: array<array<${input_B_packed_type_WGSL}, ${loading_points_per_compute_block_B.cols}>, ${
-              loading_points_per_compute_block_B.rows}>;
+${InputBBlockOptionalRegisterCacheHelper.defineRegisterCacheWGSL}
 ${
-              assignLoadingPointsToTargetStats(
-                  'compute_block_input_B',
-                  inputBBlockLoadingPointsFromCacheExprWGSL(
-                      valid_loop_vars_or_values.compute_block_thread_K_inner!, 'compute_block_N_TSG_biased'),
-                  0)}
+              InputBBlockOptionalRegisterCacheHelper.updateRegisterCache(
+                  inputBBlockLoadingPointsFromCacheWithComputeLoopVarOrValueExprWGSL(
+                      valid_loop_vars_or_values.compute_block_thread_K_inner!,
+                      valid_loop_vars_or_values.compute_block_thread_N!))}
 `,
           loop_body_after_inner_loop: () => `
 // End of compute_block_thread_N loop`,
@@ -1422,15 +1571,8 @@ let acc = \
 // Compute block
 ${
               calcComputeBlockStats(
-                  Array.from({length: loading_points_per_compute_block_A.rows})
-                      .map(
-                          (_, row) => Array.from({length: loading_points_per_compute_block_A.cols})
-                                          .map((_, col) => `compute_block_input_A[${row}][${col}]`)),
-                  Array.from({length: loading_points_per_compute_block_B.rows})
-                      .map(
-                          (_, row) => Array.from({length: loading_points_per_compute_block_B.cols})
-                                          .map((_, col) => `compute_block_input_B[${row}][${col}]`)),
-                  '(*acc)', 0, 0, compute_schema)}
+                  InputABlockOptionalRegisterCacheHelper.cachedLoadingPointsExprWGSL,
+                  InputBBlockOptionalRegisterCacheHelper.cachedLoadingPointsExprWGSL, '(*acc)', 0, 0, compute_schema)}
 `
         };
 
@@ -1761,11 +1903,11 @@ input A batches ${batchAggregatedInputs[0].dims[0]} * input B batches ${batchAgg
       };
 
       const schedule_params: ShaderScheduleSchemaParameters = {
-        // compute_schema: 'scaledVector',
-        compute_schema: 'dotProduct',
+        compute_schema: 'scaledVector',
+        // compute_schema: 'dotProduct',
         tensor_slice: {
-          // tensor_slice_factor: 1,
-          tensor_slice_factor: 4,
+          tensor_slice_factor: 1,
+          // tensor_slice_factor: 4,
           // tensor_slice_factor: 2,
           // tensor_slice_input_policy: 'continious',
         },
