@@ -251,6 +251,9 @@ export class WebGpuBackend {
     if (adapter.features.has('shader-f16')) {
       requiredFeatures.push('shader-f16');
     }
+    if (adapter.features.has('chromium-experimental-subgroups')) {
+      requiredFeatures.push('chromium-experimental-subgroups' as GPUFeatureName);
+    }
 
     this.device = await adapter.requestDevice(deviceDescriptor);
     this.adapterInfo = new AdapterInfoImpl(adapter.info || (await adapter.requestAdapterInfo()));

@@ -97,6 +97,9 @@ export class ProgramManager {
     if (device.features.has('shader-f16')) {
       extensions.push('enable f16;');
     }
+    if (device.features.has('chromium-experimental-subgroups')) {
+      extensions.push('enable chromium_experimental_subgroups;');
+    }
     const shaderHelper = createShaderHelper(normalizedDispatchGroupSize, this.backend.device.limits);
     const userCode = programInfo.getShaderSource(shaderHelper);
     const code = `${extensions.join('\n')}\n${shaderHelper.additionalImplementations}\n${userCode}`;
