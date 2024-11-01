@@ -4,11 +4,12 @@
 import {DataType} from '../../../wasm-common';
 import {LOG} from '../../log';
 import {TensorView} from '../../tensor-view';
-import {/*BroadcastUtil,*/ ShapeUtil} from '../../util';
-import {/*ComputeContext,*/ ProgramInfo, ProgramUniform} from '../types';
+import {ShapeUtil} from '../../util';
+import {ProgramInfo, ProgramUniform} from '../types';
 
 import {createTensorShapeVariables, getBroadcastDims, getMaxComponents, IndicesHelper, inputVariable, internalVariable, outputVariable, ShaderHelper, tensorTypeToWsglStorageType, UniformsArrayType} from './common';
 import {appendActivationUniforms, appendActivationUniformsData, getActivationSnippet, InternalActivationAttributes} from './fuse-utils';
+import {convertOutputBatchIndicesToInputBatchIndices} from './matmul-shaders'
 
 // GEMM: Out[MxN] = activation(A[MxK] * B[KxN] + Bias[MxN])
 interface BufferLayoutInfo {
@@ -51,7 +52,7 @@ interface GEMMOperationParameters {
   tensor_data_type: number;
   input_A: TensorInfo;
   input_B: TensorInfo;
-  input_Bias?: TensorInfo;
+  // input_Bias?: TensorInfo;
   output: TensorInfo;
   activation: InternalActivationAttributes;
 }
@@ -67,7 +68,6 @@ interface PerWorkgroupLimits {
 interface GEMMWorkgroupScheduleParameters {
   output_rows_per_workgroup: number;
   output_cols_per_workgroup: number;
-  threads_per_workgroup: number;
   // limits: PerWorkgroupLimits;
 }
 
@@ -75,12 +75,22 @@ type ScheduleSchemaSubgroupsParameters = {
   use_subgroups: false;
 }|{
   use_subgroups: true;
-  subgroups_shared_on: 'A'|'B';
+  // subgroups_shared_on: 'A'|'B';
   // Consider adaptive subgroup size
   expected_subgroup_size: number;
   thread_loading_point_register_mapping_to_subgroup_block: 'adjacent'|'interleaved';
 };
 
+type FirstLevelCacheType = 'no_cache' | 'shared_memory' | 'subgroup';
+
+type CacheHierarchyParameters = {
+  buffer_A_cache_type: FirstLevelCacheType;
+  buffer_B_cache_type: FirstLevelCacheType;
+  use_register_cache_for_outer_spatial_loop: boolean;
+  subgroups_parameters: ScheduleSchemaSubgroupsParameters;
+}
+
+/*
 // Tensor slice divides inputs along K dimension,
 // makes A[MxK]*B[KxN] into Ai[MxKs]*Bi[KsxN], Ks = K / factor,
 // i = 0 to factor-1.
@@ -89,9 +99,21 @@ type ScheduleSchemaTensorSliceParameters = {
   // How to divide the input A and B along K dimension
   // tensor_slice_input_policy: 'continious' | 'interleaved';
 };
+*/
 
 type ShaderScheduleSchemaParameters = {
-  compute_schema: 'dotProduct'|'scaledVector'; tensor_slice: ScheduleSchemaTensorSliceParameters;
+  threads_per_workgroup: number;
+  threads_along_M_per_TSG?: number;
+  threads_along_N_per_TSG?: number;
+  tensor_slice_factor: number;
+  // M-major = adjacent thread has adjacent thread_N_in_TSG
+  threads_within_TSG_major_M_not_N: boolean;
+  spatial_loop_order: 'M_outer'|'N_outer';
+  unfold_spatial_M_loop: boolean;
+  unfold_spatial_N_loop: boolean;
+  unfold_K_inner_loop: boolean;
+  compute_block_thread_K_inner_loop_step: number;
+  compute_schema: 'dotProduct'|'scaledVector';
 };
 
 // const arrayOf = (length: number) => Array.from({length});
@@ -1033,21 +1055,38 @@ export function templatedMatMulProgram(
     op_params: GEMMOperationParameters,
     workgroup_params: GEMMWorkgroupScheduleParameters,
     schedule_params: ShaderScheduleSchemaParameters,
+    cache_hierarchy_parameters: CacheHierarchyParameters,
+    /*
     subgroup_cache_params: ScheduleSchemaSubgroupsParameters = {
       use_subgroups: false
     },
+    */
     ): ProgramInfo {
-  const {batches_info, input_A, input_B, input_Bias, output, activation, tensor_data_type} = op_params;
+  const {batches_info, input_A, input_B, /*input_Bias,*/ output, activation, tensor_data_type} = op_params;
 
   const {output_rows_per_workgroup, output_cols_per_workgroup} = workgroup_params;
-  const {compute_schema, tensor_slice} = schedule_params;
-  const {tensor_slice_factor} = tensor_slice;
+  const {
+    threads_per_workgroup,
+    tensor_slice_factor,
+    threads_within_TSG_major_M_not_N,
+    spatial_loop_order,
+    unfold_spatial_M_loop,
+    unfold_spatial_N_loop,
+    unfold_K_inner_loop,
+    compute_block_thread_K_inner_loop_step,
+    compute_schema,
+  } = schedule_params;
+  let {
+    threads_along_M_per_TSG,
+    threads_along_N_per_TSG,
+  } = schedule_params;
 
+  /*
   const has_bias = typeof input_Bias !== 'undefined';
-
   assert(
       !has_bias || output.aggregated_batches === input_Bias.aggregated_batches,
       `Expect input_bias.batches ${input_Bias?.aggregated_batches} === output.batches ${output.aggregated_batches}`);
+  */
 
   assert(
       input_A.cols === input_B.rows,
@@ -1133,69 +1172,62 @@ dividable by compute_block_shape ${PrintMKN(compute_block_shape)}`);
   // -----------------------------------------------------------------------------
   //   Scheduling decision
   // -----------------------------------------------------------------------------
-  // TODO: Should be parameters or decided by schedule.
-  // M-major = adjacent thread has adjacent thread_N_in_TSG
-  let buffer_A_cache_type: 'void'|'shared_memory'|'subgroup' =
-      (subgroup_cache_params.use_subgroups && subgroup_cache_params.subgroups_shared_on === 'A') ?
-      'subgroup' :
-      (['void', 'shared_memory', 'subgroup'] as const)[1 as number];
-  let buffer_B_cache_type: 'void'|'shared_memory'|'subgroup' =
-      (subgroup_cache_params.use_subgroups && subgroup_cache_params.subgroups_shared_on === 'B') ?
-      'subgroup' :
-      (['void', 'shared_memory', 'subgroup'] as const)[1 as number];
+  const {buffer_A_cache_type, buffer_B_cache_type, use_register_cache_for_outer_spatial_loop, subgroups_parameters} = cache_hierarchy_parameters;
+  const use_subgroups = buffer_A_cache_type === 'subgroup' || buffer_B_cache_type === 'subgroup';
+  assert(!(buffer_A_cache_type === 'subgroup' && buffer_B_cache_type === 'subgroup'), 'Subgroup cache can be enabled for at most one input.');
 
-  // const input_A_register_cache_enabled: boolean = buffer_A_cache_type !== 'subgroup';
-  // const input_B_register_cache_enabled: boolean = buffer_B_cache_type !== 'subgroup';
-  const input_A_register_cache_enabled: boolean = false;
-  const input_B_register_cache_enabled: boolean = true;
-
-  // Might be parameter
-  const threads_within_TSG_major_M_not_N: boolean = buffer_B_cache_type !== 'subgroup';
   assert(
       (!threads_within_TSG_major_M_not_N) || buffer_B_cache_type !== 'subgroup',
       `Using subgroup cache for input B require !threads_within_TSG_major_M_not_N.`);
-  const spatial_loop_order: 'M_outer'|'N_outer' = 'N_outer' as 'M_outer' | 'N_outer';
-  // Might be parameter
-  const unfold_spatial_M_loop: boolean = buffer_A_cache_type === 'subgroup';
-  const unfold_spatial_N_loop: boolean = buffer_B_cache_type === 'subgroup';
-  const unfold_K_inner_loop: boolean = subgroup_cache_params.use_subgroups;
 
-  // const compute_block_thread_K_inner_loop_step: number|string = 1;
-  const compute_block_thread_K_inner_loop_step: number|string = 8;
+  assert(buffer_A_cache_type !== 'subgroup' || unfold_spatial_M_loop, 'Spatial M loop must be unfolded for buffer A using subgroup cache.');
+  assert(buffer_B_cache_type !== 'subgroup' || unfold_spatial_N_loop, 'Spatial N loop must be unfolded for buffer A using subgroup cache.');
+  assert(!use_subgroups || unfold_K_inner_loop, 'K inner loop must be unfolded for using subgroup cache.');
+  /*
   assert(
-      workgroup_params.threads_per_workgroup % tensor_slice_factor === 0,
-      `Workgroup size ${workgroup_params.threads_per_workgroup} should be a multiple of tensor_slice_factor ${
+    !unfold_K_inner_loop || typeof compute_block_thread_K_inner_loop_step === 'number',
+    `compute_block_thread_K_inner_loop_step must be a number, got ${compute_block_thread_K_inner_loop_step}`
+  );
+  */
+
+  const input_A_register_cache_enabled = spatial_loop_order === 'M_outer' && use_register_cache_for_outer_spatial_loop;
+  const input_B_register_cache_enabled = spatial_loop_order === 'N_outer' && use_register_cache_for_outer_spatial_loop;
+
+  assert(
+      threads_per_workgroup % tensor_slice_factor === 0,
+      `Workgroup size ${threads_per_workgroup} should be a multiple of tensor_slice_factor ${
           tensor_slice_factor}`);
-  const threads_per_TSG = workgroup_params.threads_per_workgroup / tensor_slice_factor;
-  const threads_along_M_per_TSG = 8;
+  const threads_per_TSG = threads_per_workgroup / tensor_slice_factor;
+
+  if (threads_along_N_per_TSG === undefined && threads_along_M_per_TSG !== undefined) {
+    threads_along_N_per_TSG = Math.floor(threads_per_TSG / threads_along_M_per_TSG);
+  }
+  if (threads_along_M_per_TSG === undefined && threads_along_N_per_TSG !== undefined) {
+    threads_along_M_per_TSG = Math.floor(threads_per_TSG / threads_along_N_per_TSG);
+  }
   assert(
-      threads_per_TSG % threads_along_M_per_TSG === 0,
-      `threads_per_TSG ${threads_per_TSG} should be a multiple of threads_along_M_per_TSG ${threads_along_M_per_TSG}`);
-  const threads_along_N_per_TSG = threads_per_TSG / threads_along_M_per_TSG;
+    threads_along_M_per_TSG !== undefined &&
+    threads_along_N_per_TSG !== undefined &&
+    threads_per_TSG === threads_along_M_per_TSG * threads_along_N_per_TSG,
+    `threads_along_M_per_TSG ${threads_along_M_per_TSG} * threads_along_N_per_TSG ${threads_along_N_per_TSG} should be threads_per_TSG ${threads_per_TSG}`
+    );
 
   assert(
-      compute_blocks_per_workgroup.M % threads_along_M_per_TSG === 0,
+      compute_blocks_per_workgroup.M % threads_along_M_per_TSG! === 0,
       `compute_blocks_per_workgroup.M ${
           compute_blocks_per_workgroup.M} should be a multiple of threads_along_M_per_TSG ${threads_along_M_per_TSG}`);
-  const compute_blocks_per_thread_M: number|string = compute_blocks_per_workgroup.M / threads_along_M_per_TSG;
+  const compute_blocks_per_thread_M: number|string = compute_blocks_per_workgroup.M / threads_along_M_per_TSG!;
   assert(
-      compute_blocks_per_workgroup.N % threads_along_N_per_TSG === 0,
+      compute_blocks_per_workgroup.N % threads_along_N_per_TSG! === 0,
       `compute_blocks_per_workgroup.N ${
           compute_blocks_per_workgroup.N} should be a multiple of threads_along_N_per_TSG ${threads_along_N_per_TSG}`);
-  const compute_blocks_per_thread_N: number|string = compute_blocks_per_workgroup.N / threads_along_N_per_TSG;
+  const compute_blocks_per_thread_N: number|string = compute_blocks_per_workgroup.N / threads_along_N_per_TSG!;
 
   const dispatch_workgroups = {
     x: Math.ceil(logical_scalar_size.M / logical_scalar_size_per_workgroup.M),
     y: Math.ceil(logical_scalar_size.N / logical_scalar_size_per_workgroup.N),
     z: output.aggregated_batches,
   } as const;
-
-  // -----------------------------------------------------------------------------
-  //   Handle the batch dims broadcasting
-  // -----------------------------------------------------------------------------
-  const {output_batch_dims, input_A_batch_dims, input_B_batch_dims} = batches_info;
-  const input_A_broadcasted_dims = getBroadcastDims(input_A_batch_dims, output_batch_dims);
-  const input_B_broadcasted_dims = getBroadcastDims(input_B_batch_dims, output_batch_dims);
 
   // -----------------------------------------------------------------------------
   //   Uniforms definition and values
@@ -1296,12 +1328,12 @@ ${
   ];
   const input_tensors_shape = [
     input_A_tensor_loading_points_shape, input_B_tensor_loading_points_shape,
-    ...(has_bias ? [output_tensor_loading_points_shape] : [])
+    // ...(has_bias ? [output_tensor_loading_points_shape] : [])
   ];
 
   // Push unaggregated batch dims for batch helper
-  const batch_helpers_dims = [output_batch_dims, input_A_batch_dims, input_B_batch_dims];
-  programUniforms.push(...createTensorShapeVariables(...batch_helpers_dims));
+  const {output_batch_dims, input_A_batch_dims, input_B_batch_dims} = batches_info;
+  programUniforms.push(...createTensorShapeVariables(output_batch_dims, input_A_batch_dims, input_B_batch_dims));
   // Push aggregated inputs and output shape
   programUniforms.push(...createTensorShapeVariables(...input_tensors_shape));
   programUniforms.push(...createTensorShapeVariables(output_tensor_loading_points_shape));
@@ -1316,12 +1348,14 @@ ${
             inputVariable('input_A', tensor_data_type, 3, input_A.buffer_layout.packed_vector_size);
         const input_B_variable =
             inputVariable('input_B', tensor_data_type, 3, input_B.buffer_layout.packed_vector_size);
+        /*
         const input_Bias_variable = has_bias ?
             inputVariable('input_Bias', tensor_data_type, 3, input_Bias.buffer_layout.packed_vector_size) :
             undefined;
+        */
         const output_variable = outputVariable('output', tensor_data_type, 3, output.buffer_layout.packed_vector_size);
 
-        const input_variables = [input_A_variable, input_B_variable, ...(has_bias ? [input_Bias_variable!] : [])];
+        const input_variables = [input_A_variable, input_B_variable, /*...(has_bias ? [input_Bias_variable!] : [])*/];
 
         // -----------------------------------------------------------------------------
         //   Batch helper variables
@@ -1342,10 +1376,15 @@ ${
         //   WGSL types
         // -----------------------------------------------------------------------------
         assert(
-            input_A.type === input_B.type && (!has_bias || input_B.type === input_Bias.type),
-            `Expect types of input_A ${input_A.type} and input_B ${input_B.type} ${
-                has_bias ? `and input_Bias ${input_Bias.type} ` : ''}are the same`);
+            input_A.type === input_B.type,
+            `Expect types of input_A ${input_A.type} and input_B ${input_B.type} are the same`);
         ;
+        /*
+        assert(
+            !has_bias || input_A.type === input_Bias.type,
+            `Expect types of input_A ${input_A.type} and input_Bias ${input_Bias.type} are the same`);
+        ;
+        */
         const scalar_type_WGSL = input_A.type;
         const scalar_or_vector_type_WGSL = (packed_size: number) =>
             packed_size > 1 ? `vec${packed_size}<${scalar_type_WGSL}>` : scalar_type_WGSL
@@ -1372,34 +1411,9 @@ fn ConvertOutputBatchToInputBatch(output_batch: u32) -> vec2<u32> {
     let batch_indices = ${output_batch_helper.offsetToIndices('output_batch')};
 
     var input_A_indices: ${input_A_batch_helper.type.indices};
-    ${
-                u32LoopUpFrom0WGSL(
-                    'index_A', input_A_batch_dims.length,
-                    (index_A: number) => `
-        ${
-                        input_A_batch_helper.indicesSet(
-                            'input_A_indices', index_A,
-                            input_A_broadcasted_dims.includes(index_A) ?
-                                0 :
-                                output_batch_helper.indicesGet(
-                                    'batch_indices', index_A + output_batch_dims.length - input_A_batch_dims.length))}
-    `,
-                    false, 4)}
-
+    ${convertOutputBatchIndicesToInputBatchIndices('input_A_indices', input_A_batch_helper, input_A_batch_helper.rank, output_batch_helper.rank, 'batch_indices')}
     var input_B_indices: ${input_B_batch_helper.type.indices};
-    ${
-                u32LoopUpFrom0WGSL(
-                    'index_B', input_B_batch_dims.length,
-                    (index_B: number) => `
-        ${
-                        input_B_batch_helper.indicesSet(
-                            'input_B_indices', index_B,
-                            input_B_broadcasted_dims.includes(index_B) ?
-                                0 :
-                                output_batch_helper.indicesGet(
-                                    'batch_indices', index_B + output_batch_dims.length - input_B_batch_dims.length))}
-    `,
-                    false, 4)}
+    ${convertOutputBatchIndicesToInputBatchIndices('input_B_indices', input_B_batch_helper, input_B_batch_helper.rank, output_batch_helper.rank, 'batch_indices')}
 
     let input_A_batch: u32 = ${input_A_batch_helper.indicesToOffset('input_A_indices')};
     let input_B_batch: u32 = ${input_B_batch_helper.indicesToOffset('input_B_indices')};
@@ -1455,11 +1469,13 @@ fn ${function_name}(loading_point_row: i32, loading_point_col: i32, batch: u32) 
         const buffer_B_loading_function_name = createLoadBufferHelperFunction(
             'LoadFromBufferB', input_B_variable, input_B_packed_type_WGSL, input_B.buffer_layout.loading_points_layout,
             'input_B_loading_points_matrix_dims');
+        /*
         const buffer_Bias_loading_function_name = has_bias ?
             createLoadBufferHelperFunction(
                 'LoadFromBufferBias', input_Bias_variable!, output_packed_type_WGSL,
                 input_Bias.buffer_layout.loading_points_layout, 'input_Bias_loading_points_matrix_dims') :
             undefined;
+        */
 
         const createStoreBufferHelperFunction = (
             function_name: string,
@@ -1510,9 +1526,11 @@ fn ${function_name}(value: ${packed_type_in_buffer_WGSL}, loading_point_row: i32
             callBufferLoadingFunctionExprBuilder(buffer_A_loading_function_name, 'batch_A');
         const callBufferBLoadingFunctionExpr =
             callBufferLoadingFunctionExprBuilder(buffer_B_loading_function_name, 'batch_B');
+        /*
         const callBufferBiasLoadingFunctionExpr = has_bias ?
             callBufferLoadingFunctionExprBuilder(buffer_Bias_loading_function_name!, 'batch_output') :
             undefined;
+        */
 
         const getBufferLoadingPointInTSGExprBuilder =
             (callBufferLoadingFunctionExpr: (loading_point_row: string, loading_point_col: string) => string,
@@ -1677,6 +1695,8 @@ ${
             let output_vector = &((*output_block)[${row}][${col}]);
             let output_loading_points_global_row = output_loading_point_block_global_base_row + ${row};
             let output_loading_points_global_col = output_loading_point_block_global_base_col + ${col};
+            ${
+            /*
             // Add bias if any
             ${
                                           has_bias ? `
@@ -1685,6 +1705,10 @@ ${
                                                          ('output_loading_points_global_row',
                                                           'output_loading_points_global_col')};` :
                                                      ''}
+            */
+              ''
+            }
+
             // Handle activation if any
             ${getActivationSnippet(activation, output_packed_type_WGSL, scalar_type_WGSL, '(*output_vector)')}
             // Write back output
@@ -1708,7 +1732,7 @@ ${
         let compute_loop_input_B_block_access_helper: ComputeLoopInputBlockAccessHelper;
 
         switch (buffer_A_cache_type) {
-          case ('void'): {
+          case ('no_cache'): {
             buffer_A_cache = new VoidCacheHelper({
               variable_name: 'input_A',
               threads_per_TSG,
@@ -1745,7 +1769,7 @@ ${
             break;
           }
           case ('subgroup'): {
-            if (!subgroup_cache_params.use_subgroups) {
+            if (!subgroups_parameters.use_subgroups) {
               throw new Error(`Using subgroup cache without valid subgroup_cache_params.`);
             }
             // Ensure all threads in a subgroup have the same thread_M_in_TSG and thus access the same input row block
@@ -1753,10 +1777,10 @@ ${
                 threads_within_TSG_major_M_not_N,
                 'Using subgroup cache for input A requires threads_within_TSG_major_M_not_N.');
             assert(
-                threads_along_N_per_TSG % subgroup_cache_params.expected_subgroup_size === 0,
+                threads_along_N_per_TSG! % subgroups_parameters.expected_subgroup_size === 0,
                 `Using subgroup cache for input A requires threads_along_N_per_TSG ${
                     threads_along_N_per_TSG} can be divided by expected_subgroup_size ${
-                    subgroup_cache_params.expected_subgroup_size}.`);
+                      subgroups_parameters.expected_subgroup_size}.`);
 
             const cache_compute_blocks_per_subgroup: RowsColsSpan = {
               rows: compute_blocks_per_thread_M,
@@ -1775,13 +1799,13 @@ ${
               sourceLoadingPointTSGAccessingExpr: (_: string, row_in_TSG: string, col_in_TSG: string) =>
                   getBufferALoadingPointInTSGExpr(row_in_TSG, col_in_TSG),
               loading_points_prefer_major: 'row',
-              subgroup_size: subgroup_cache_params.expected_subgroup_size,
+              subgroup_size: subgroups_parameters.expected_subgroup_size,
               cache_compute_blocks_per_subgroup,
               loading_point_row_subgroup_cache_step_base_WGSL:
                   `thread_M_in_TSG * ${compute_blocks_per_thread_M} * ${loading_points_per_compute_block_A.rows}`,
               loading_point_col_subgroup_cache_step_base_WGSL: '0',
               thread_loading_point_register_mapping_to_subgroup_block:
-                  subgroup_cache_params.thread_loading_point_register_mapping_to_subgroup_block,
+              subgroups_parameters.thread_loading_point_register_mapping_to_subgroup_block,
             });
             compute_loop_input_A_block_access_helper =
                 new ComputeLoopInputBlockSubgroupSharedCacheAccessHelper(loading_points_per_compute_block_A);
@@ -1790,7 +1814,7 @@ ${
         }
 
         switch (buffer_B_cache_type) {
-          case ('void'): {
+          case ('no_cache'): {
             buffer_B_cache = new VoidCacheHelper({
               variable_name: 'input_B',
               threads_per_TSG,
@@ -1828,7 +1852,7 @@ ${
           }
 
           case ('subgroup'): {
-            if (!subgroup_cache_params.use_subgroups) {
+            if (!subgroups_parameters.use_subgroups) {
               throw new Error(`Using subgroup cache without valid subgroup_cache_params.`);
             }
             // Ensure all threads in a subgroup have the same thread_N_in_TSG and thus access the same input col block
@@ -1836,10 +1860,10 @@ ${
                 !threads_within_TSG_major_M_not_N,
                 'Using subgroup cache for input B requires !threads_within_TSG_major_M_not_N.');
             assert(
-                threads_along_M_per_TSG % subgroup_cache_params.expected_subgroup_size === 0,
+                threads_along_M_per_TSG! % subgroups_parameters.expected_subgroup_size === 0,
                 `Using subgroup cache for input B requires threads_along_M_per_TSG ${
                     threads_along_M_per_TSG} can be divided by expected_subgroup_size ${
-                    subgroup_cache_params.expected_subgroup_size}.`);
+                      subgroups_parameters.expected_subgroup_size}.`);
 
             const cache_compute_blocks_per_subgroup: RowsColsSpan = {
               rows: compute_block_thread_K_inner_loop_step,
@@ -1858,13 +1882,13 @@ ${
               sourceLoadingPointTSGAccessingExpr: (_: string, row_in_TSG: string, col_in_TSG: string) =>
                   getBufferALoadingPointInTSGExpr(row_in_TSG, col_in_TSG),
               loading_points_prefer_major: 'row',
-              subgroup_size: subgroup_cache_params.expected_subgroup_size,
+              subgroup_size: subgroups_parameters.expected_subgroup_size,
               cache_compute_blocks_per_subgroup,
               loading_point_row_subgroup_cache_step_base_WGSL: '0',
               loading_point_col_subgroup_cache_step_base_WGSL:
                   `thread_N_in_TSG * ${compute_blocks_per_thread_N} * ${loading_points_per_compute_block_B.cols}`,
               thread_loading_point_register_mapping_to_subgroup_block:
-                  subgroup_cache_params.thread_loading_point_register_mapping_to_subgroup_block,
+              subgroups_parameters.thread_loading_point_register_mapping_to_subgroup_block,
             });
             compute_loop_input_B_block_access_helper =
                 new ComputeLoopInputBlockSubgroupSharedCacheAccessHelper(loading_points_per_compute_block_A);
@@ -2044,7 +2068,7 @@ ${
         const shader = `
 // Matmul templated shader
 
-const WGS = ${workgroup_params.threads_per_workgroup}u;
+const WGS = ${threads_per_workgroup}u;
 const tensor_slice_groups = ${tensor_slice_factor}u;
 const threads_per_TSG = ${threads_per_TSG}u;  // WGS / tensor_slice_groups
 const_assert(tensor_slice_groups * threads_per_TSG == WGS);
@@ -2091,13 +2115,13 @@ ${
 // Workgroup-cached uniforms
 var<workgroup> input_A_loading_points_matrix_dims: vec2<i32>;
 var<workgroup> input_B_loading_points_matrix_dims: vec2<i32>;
-${has_bias ? 'var<workgroup> input_Bias_loading_points_matrix_dims: vec2<i32>;' : ''}
+${/*has_bias ? 'var<workgroup> input_Bias_loading_points_matrix_dims: vec2<i32>;' : */''}
 var<workgroup> output_loading_points_matrix_dims: vec2<i32>;
 
 fn WorkgroupInit() {
   input_A_loading_points_matrix_dims = vec2<i32>(${input_A_variable.shape}.yz);
   input_B_loading_points_matrix_dims = vec2<i32>(${input_B_variable.shape}.yz);
-  ${has_bias ? `input_Bias_loading_points_matrix_dims = vec2<i32>(${input_Bias_variable!.shape}.yz);` : ''}
+  ${/*has_bias ? `input_Bias_loading_points_matrix_dims = vec2<i32>(${input_Bias_variable!.shape}.yz);` : */''}
   output_loading_points_matrix_dims = vec2<i32>(${output_variable.shape}.yz);
 }
 
@@ -2174,8 +2198,8 @@ ${buffer_B_cache.cacheMemoryModuleDefinitionWGSL()}
 fn main(
     @builtin(workgroup_id) wid: vec3u,
     @builtin(local_invocation_id) lid: vec3u,
-    ${subgroup_cache_params.use_subgroups ? '@builtin(subgroup_invocation_id) subgroup_id: u32,' : ''}
-    ${subgroup_cache_params.use_subgroups ? '@builtin(subgroup_size) subgroup_size: u32,' : ''}
+    ${subgroups_parameters.use_subgroups ? '@builtin(subgroup_invocation_id) subgroup_id: u32,' : ''}
+    ${subgroups_parameters.use_subgroups ? '@builtin(subgroup_size) subgroup_size: u32,' : ''}
 ) {
     if(all(lid == vec3u())) {
       WorkgroupInit();
@@ -2287,10 +2311,6 @@ fn main(
       input_B: input_B.buffer_layout.packed_vector_size,
       output: output.buffer_layout.packed_vector_size,
     },
-    batch_indices: {
-      input_A_broadcasted_dims,
-      input_B_broadcasted_dims,
-    },
   };
 
   // LOG(`fatal`, `templatedMatMulProgram Return`);
@@ -2302,7 +2322,7 @@ fn main(
       // hint: `${activation.activation};${Object.entries(workgroup_params).map((entry) =>
       // entry.join(':')).join(';')};`,
       hint: `${Object.entries(cacheKey).map((entry) => entry.map(x => JSON.stringify(x)).join(':')).join(';')};`,
-      inputDependencies: has_bias ? ['rank', 'rank', 'rank'] : ['rank', 'rank']
+      inputDependencies: /*has_bias ? ['rank', 'rank', 'rank'] : */ ['rank', 'rank']
     },
     getShaderSource: trival_shader,
     getRunData: () => ({
@@ -2377,9 +2397,11 @@ export const templatedMatMulDriver = (
         tensor_data_type,
         input_A: createMatrixTensorInfo(batchAggregatedInputs[0].dims, tensor_data_type, 'NHW'),
         input_B: createMatrixTensorInfo(batchAggregatedInputs[1].dims, tensor_data_type, 'NHW'),
+        /*
         input_Bias: batchAggregatedInputs.length >= 3 ?
             createMatrixTensorInfo(batchAggregatedInputs[2].dims, tensor_data_type, 'NHW') :
             undefined,
+        */
         output: createMatrixTensorInfo(batchAggregatedOutputShape, tensor_data_type, 'NHW'),
         activation: activationAttributes
       };
@@ -2387,7 +2409,6 @@ export const templatedMatMulDriver = (
       const workgroup_params: GEMMWorkgroupScheduleParameters = {
         output_rows_per_workgroup: 32,
         output_cols_per_workgroup: 64,
-        threads_per_workgroup: 128,
         /*
         limits: {
             maximium_register_size: 32,
@@ -2396,28 +2417,51 @@ export const templatedMatMulDriver = (
         */
       };
 
-      const schedule_params: ShaderScheduleSchemaParameters = {
-        compute_schema: 'scaledVector',
-        // compute_schema: 'dotProduct',
-        tensor_slice: {
-          tensor_slice_factor: 1,
-          // tensor_slice_factor: 4,
-          // tensor_slice_factor: 2,
-          // tensor_slice_input_policy: 'continious',
-        },
+      const cache_hierarchy_parameters: CacheHierarchyParameters = {
+        buffer_A_cache_type: 'subgroup',
+        buffer_B_cache_type: 'shared_memory',
+        use_register_cache_for_outer_spatial_loop: true,
+        subgroups_parameters: {
+          use_subgroups: true,
+          // subgroups_shared_on: 'A',
+          expected_subgroup_size: 16,
+          // thread_loading_point_register_mapping_to_subgroup_block: 'adjacent',
+          thread_loading_point_register_mapping_to_subgroup_block: 'interleaved',
+        } as ScheduleSchemaSubgroupsParameters,
       };
 
-      const subgroup_cache_params: ScheduleSchemaSubgroupsParameters = {
-        use_subgroups: true,
-        subgroups_shared_on: 'A',
-        expected_subgroup_size: 16,
-        // thread_loading_point_register_mapping_to_subgroup_block: 'adjacent',
-        thread_loading_point_register_mapping_to_subgroup_block: 'interleaved',
+      const buffer_A_use_subgroup = cache_hierarchy_parameters.buffer_A_cache_type === 'subgroup';
+      const buffer_B_use_subgroup = cache_hierarchy_parameters.buffer_B_cache_type === 'subgroup';
+      const use_subgroup = buffer_A_use_subgroup || buffer_B_use_subgroup;
+      const always_unfold_loops: boolean = false;
+
+      const schedule_params: ShaderScheduleSchemaParameters = {
+        threads_per_workgroup: 128,
+        threads_along_M_per_TSG: undefined,
+        threads_along_N_per_TSG: 16,
+        tensor_slice_factor: 1,
+        // tensor_slice_factor: 4,
+        // tensor_slice_factor: 2,
+
+        // M-major = adjacent thread has adjacent thread_N_in_TSG
+        // threads_within_TSG_major_M_not_N: buffer_B_cache_type !== 'subgroup',
+        threads_within_TSG_major_M_not_N: true,
+        // Might be parameter
+        spatial_loop_order: 'N_outer',
+        unfold_spatial_M_loop: always_unfold_loops || buffer_A_use_subgroup,
+        unfold_spatial_N_loop: always_unfold_loops || buffer_B_use_subgroup,
+        unfold_K_inner_loop: always_unfold_loops || use_subgroup,
+        // TODO: Should be parameters
+        // const compute_block_thread_K_inner_loop_step: number|string = 1,
+        compute_block_thread_K_inner_loop_step: 8,
+
+        compute_schema: 'scaledVector',
+        // compute_schema: 'dotProduct',
       };
 
       LOG(`fatal`, `Before templatedMatMulProgram`);
 
-      return templatedMatMulProgram(op_params, workgroup_params, schedule_params, subgroup_cache_params);
+      return templatedMatMulProgram(op_params, workgroup_params, schedule_params, cache_hierarchy_parameters);
     }
 
 export const createComputeBlockMatmulNaiveProgramInfo =
