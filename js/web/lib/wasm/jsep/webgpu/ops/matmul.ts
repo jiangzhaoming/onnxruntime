@@ -42,6 +42,7 @@ export const matMul = (context: ComputeContext): void => {
     const batchA = ShapeUtil.size(context.inputs[0].dims.slice(0, -2));
     const batchB = ShapeUtil.size(context.inputs[1].dims.slice(0, -2));
     if (batchA !== 1 && M === 1 && batchB === 1) {
+      // Optimization for batched vec-mat-mul
       const reshapedA = context.inputs[0].reshape([1, batchA, K]);
       const reshapedB = context.inputs[1].reshape([1, K, N]);
       const matmulOutputShape = [1, batchA, N];
