@@ -109,7 +109,10 @@ export class ProgramManager {
 
     const shaderHelper = createShaderHelper(normalizedDispatchGroupSize, this.backend.device.limits);
     const userCode = programInfo.getShaderSource(shaderHelper);
-    const code = `${enableDirectives.join('\n')}\n${shaderHelper.additionalImplementations}\n${userCode}`;
+    const code = `// ${programInfo.name} ${programInfo.shaderCache?.hint || ''}
+${enableDirectives.join('\n')}
+${shaderHelper.additionalImplementations}
+${userCode}`;
     const shaderModule = device.createShaderModule({ code, label: programInfo.name });
     LOG_DEBUG('verbose', () => `[WebGPU] ${programInfo.name} shader code: ${code}`);
 
