@@ -293,7 +293,11 @@ export const createMatMulNBitsBlockSize32ProgramInfo = (
    * workgroupY is a divisor of dimBOuter (i.e. N), could be 1, 4, or 8
    * Workgroup cached A is shared within the same workgroupY
    */
-  const workgroupY = dimBOuter % 16 === 0 ? 16 : dimBOuter % 8 === 0 ? 8 : dimBOuter % 4 === 0 ? 4 : 1;
+  const workgroupY =
+    dimBOuter % 16 === 0 ? 16 :
+    dimBOuter % 8 === 0 ? 8 :
+    dimBOuter % 4 === 0 ? 4 :
+    1;
   const workgroupX = workgroupSize / workgroupY;
   /**
    * tileSize = workgroupX * bComponents * 8
@@ -456,7 +460,7 @@ export const createMatMulNBitsSubgroupsBlockSize32NProgramInfo = (
     /**
      * Expected subgroup size, threads within the same subgroup share the cached A input.
      */
-    subgroupSize: 16;
+    subgroupSize: 16 | 32;
     /**
      * Number of threads working on the same output with different split of input A.
      * Workgroup size would be subgroupSize * kSplitFactor.
@@ -663,7 +667,7 @@ blobSizeInScalarB (${blobSizeInScalarB}) should divide another.`);
             const componentBForCurrentComputation =
               Math.floor(scalarKCurrentComputationStepStart / 8 /* 8U4 */) % 4; /* vec4 */
             /** An u32 component of B is decoded to Mat2x4, treated as 2 rows of vec4 B input */
-            const dequantizedMatrixRow = (scalarKCurrentComputationStepStart % 8) >> 2;
+            const dequantizedMatrixRow = scalarKCurrentComputationStepStart % 8 >> 2;
             /** If current computation step handle new component of B, have to do the dequantization. */
             const isNewComponentB = scalarKCurrentComputationStepStart % 8 /* 8U4 */ === 0;
 
@@ -747,10 +751,12 @@ fn main(
   // block = BlockBPerLoop * k_split_id + loop_K * BlockBPerLoop * KSplitFactor + 0..(BlockBPerLoop-1)
   var block: u32 = BlockBPerLoop * k_split_id;
   var scale: ${scales.type.value};
-  ${zeroPoints?
-    `var zero_point: ${dataType};`:
-    `// The default zero point is 8 for unsigned 4-bit quantization.
-  let zero_point = ${dataType}(${8.0});`}
+  ${
+    zeroPoints
+      ? `var zero_point: ${dataType};`
+      : `// The default zero point is 8 for unsigned 4-bit quantization.
+  let zero_point = ${dataType}(${8.0});`
+  }
   var loading_point_b: ${b.type.value};
   var b_dequantized_values: mat2x4<${dataType}>;
   // Subgroup cache A position
@@ -779,8 +785,12 @@ fn main(
 
   if (local_idx < ${subgroupSize}) {
     var output_value: ${output.type.value} = ${output.type.value}(0);
-    ${Array.from({length: kSplitFactor}).map((_, kSplit) => `
-    output_value += inter_results[subgroup_id][${kSplit}];`).join('')}
+    ${Array.from({ length: kSplitFactor })
+      .map(
+        (_, kSplit) => `
+    output_value += inter_results[subgroup_id][${kSplit}];`,
+      )
+      .join('')}
     if (output_col_workgroup_base + local_idx < uniforms.output_shape[2])
     {
       ${output.setByIndices(`${output.type.indices}(batch, output_row_workgroup_base, output_col_workgroup_base + local_idx)`, 'output_value')}
@@ -792,6 +802,522 @@ fn main(
     name: 'BlockwiseMatMulNBitsSubgroups32N',
     shaderCache: {
       hint: `${attributes.blockSize};${aComponents};${bComponents};${subgroupSize};${kSplitFactor}`,
+      inputDependencies: Array(inputs.length).fill('rank'),
+    },
+    getRunData: () => ({
+      outputs: [{ dims: outputShape, dataType }],
+      dispatchGroup: { x: dispatchSize },
+      programUniforms,
+    }),
+    getShaderSource,
+  };
+};
+
+const isMultipleWGSL = (value: string | number, factor: string | number) => {
+  if (typeof value === 'number' && typeof factor === 'number') {
+    return value % factor === 0 ? 'true' : 'false';
+  } else if (typeof factor === 'number') {
+    if (factor === 1) {
+      return `true`;
+    }
+    if (Number.isInteger(Math.log2(factor))) {
+      return `((${value} & ${factor - 1}) == 0)`;
+    }
+  }
+  return `((${value} % ${factor}) == 0)`;
+};
+
+const divideWGSL = (value: string | number, factor: string | number): string | number => {
+  if (typeof value === 'number' && typeof factor === 'number') {
+    return value / factor;
+  } else if (typeof factor === 'number') {
+    if (factor === 1) {
+      return value;
+    }
+    if (Number.isInteger(Math.log2(factor))) {
+      return `((${value}) >> ${Math.log2(factor)})`;
+    }
+  }
+  return `(${value} / ${factor})`;
+};
+
+const moduloWGSL = (value: string | number, factor: string | number) => {
+  if (typeof value === 'number' && typeof factor === 'number') {
+    return value % factor;
+  } else if (typeof factor === 'number') {
+    if (factor === 1) {
+      return 0;
+    }
+    if (Number.isInteger(Math.log2(factor))) {
+      return `((${value}) & ${factor - 1})`;
+    }
+  }
+  return `(${value} % ${factor})`;
+};
+
+// Currently, only support blockSize == N*32.
+export const createMatMulNBitsSubgroupsShuffleBlockSize32NProgramInfo = (
+  inputs: readonly TensorView[],
+  attributes: MatMulNBitsAttributes,
+  shaderParams: {
+    /**
+     * Expected subgroup size, threads within the same subgroup share the cached A input.
+     */
+    subgroupSize: 8| 16 | 32;
+    /**
+     * Number of threads working on the same output with different split of input A.
+     * Workgroup size would be subgroupSize * kSplitFactor.
+     */
+    kSplitFactor: number;
+    /**
+     * How B blocks are divided to each k-split group.
+     * Block-interleaved means adjacent blocks assign to different k-split group,
+     * cachestep-interleaved means interleaved while treating max(blocksPerACacheStep, 1) blocks as atom,
+     * and continious means each k-split group takes continious blocks as workload.
+     */
+    kSplitPattern: 'cachestep-interleaved' | 'block-interleaved' | 'continious';
+    /**
+     * The number of vec4 input A holding in each thread's subgroup cache.
+     */
+    vec4InputAPerSubgroupThread?: number;
+    /**
+     *
+     */
+    // limitTotalSubgroupCacheSizeToOneBBlock?: boolean;
+    /**
+     * Directly use shared memory as acc if accInSharedMemory is true, otherwise use a register and store it
+     * into shared memory after computation done.
+     */
+    accInSharedMemory?: boolean;
+  },
+): ProgramInfo => {
+  if (attributes.blockSize < 32) {
+    throw new Error(`Currently only supports blockSize >= 32, got ${attributes.blockSize}.`);
+  }
+
+  const inputShape = inputs[0].dims;
+  const aRank = inputShape.length;
+  const dimAOuter = inputShape[aRank - 2];
+  const dimInner = attributes.k;
+  const dimBOuter = attributes.n;
+  const batchDims = inputShape.slice(0, aRank - 2);
+  const batchSize = ShapeUtil.size(batchDims);
+  /**
+   * blobSize is in u8
+   */
+  const blobSize = inputs[1].dims[2];
+  const blobSizeInWords = blobSize / 4;
+  const blockSizeInScalarB = blobSize * 2;
+  const dataType = inputs[0].dataType;
+  const aComponents = getMaxComponents(attributes.k);
+  const bComponents = getMaxComponents(blobSizeInWords);
+  const outputShape = batchDims.concat([dimAOuter, dimBOuter]);
+
+  // Assuming B blocksize >= 32, B loading point should be vec4<u32> = 32U4
+  if (bComponents !== 4) {
+    throw new Error(`Expect bComponents === 4, got ${bComponents}.`);
+  }
+
+  const {
+    subgroupSize,
+    kSplitFactor,
+    kSplitPattern,
+    vec4InputAPerSubgroupThread = 1,
+    accInSharedMemory = true,
+  } = shaderParams;
+  const workgroupSize = subgroupSize * kSplitFactor;
+  if (workgroupSize > 256) {
+    throw new Error(
+      `workgroupSize (${workgroupSize}) = subgroupSize (${subgroupSize}) * kSplitFactor (${kSplitFactor}) larger than 256.`,
+    );
+  }
+  /**
+   * Number of B scalars within a single vector of input B.
+   */
+  const scalarsPerLoadingPointB = bComponents /* Vec size of u32 */ * 8; /* Each u32 contains 8 int4 */
+  // const vec4PerBLoadingPoint = scalarsPerLoadingPointB / 4;
+
+  //-------- Input A subgroups cache information --------//
+  /**
+   * Each thread within a subgroup hold at least one vec4 of input A, and a whole subgroup should hold enough
+   * input A for using at least one loading point of B.
+   */
+  // const vec4InputAPerSubgroupThread = Math.ceil(vec4PerBLoadingPoint / subgroupSize);
+  /** Per-thread subgroup-cached input A size, in loading point */
+  const loadingPointAPerSubgroupThread = (vec4InputAPerSubgroupThread * 4) / aComponents;
+  /** Total subgroup-cached input A size, in vec4 */
+  const vec4InputAPerSubgroupCache = vec4InputAPerSubgroupThread * subgroupSize;
+  /** Total subgroup-cached input A size, in scalar */
+  const scalarInputAPerSubgroupCache = vec4InputAPerSubgroupCache * 4;
+  // /** Total subgroup-cached input A size, in A loading point */
+  const loadingPointAPerSubgroupCache = loadingPointAPerSubgroupThread * subgroupSize;
+  if (
+    scalarInputAPerSubgroupCache % blockSizeInScalarB !== 0 &&
+    blockSizeInScalarB % scalarInputAPerSubgroupCache !== 0
+  ) {
+    throw new Error(`One of scalarInputAPerSubgroupCache (${scalarInputAPerSubgroupCache}) and \
+blobSizeInScalarB (${blockSizeInScalarB}) should divide another.`);
+  }
+
+  if (blockSizeInScalarB % aComponents !== 0) {
+    throw new Error(
+      `Expect blockSizeInScalarB (${blockSizeInScalarB}) being a multiple of aComponents (${aComponents}).`,
+    );
+  }
+  const loadingPointAPerBlockB = blockSizeInScalarB / aComponents;
+
+  // Each workgroup computes subgroupSize scalars of output
+  const scalarOutputPerWorkgroup = subgroupSize;
+  const dispatchSize = ShapeUtil.size(outputShape) / scalarOutputPerWorkgroup;
+
+  const programUniforms: ProgramUniform[] = [];
+  const inputShapeTemp = [batchSize, dimAOuter, dimInner / aComponents];
+  const bShape = ShapeUtil.convertShape(inputs[1].dims).slice();
+  bShape.splice(-1, 1, blobSizeInWords / bComponents);
+  programUniforms.push(...createTensorShapeVariables(inputShapeTemp));
+  programUniforms.push(...createTensorShapeVariables(bShape));
+  programUniforms.push(...createTensorShapeVariables(inputs[2].dims));
+  if (inputs.length === 4) {
+    programUniforms.push(...createTensorShapeVariables(ShapeUtil.convertShape(inputs[3].dims)));
+  }
+  const outputShapeTemp = [batchSize, dimAOuter, dimBOuter];
+  programUniforms.push(...createTensorShapeVariables(outputShapeTemp));
+
+  const getShaderSource = (shaderHelper: ShaderHelper) => {
+    const inputRank = inputShapeTemp.length;
+    const a = inputVariable('a', inputs[0].dataType, inputRank, aComponents);
+    const b = inputVariable('b', DataType.uint32, bShape.length, bComponents);
+    const scales = inputVariable('scales', inputs[2].dataType, inputs[2].dims.length);
+    const inputVariables = [a, b, scales];
+    const zeroPoints =
+      inputs.length === 4 ? inputVariable('zero_points', DataType.uint32, inputs[3].dims.length) : undefined;
+    if (zeroPoints) {
+      inputVariables.push(zeroPoints);
+    }
+    const outputRank = outputShapeTemp.length;
+    const output = outputVariable('output', inputs[0].dataType, outputRank);
+    const dataType = tensorTypeToWsglStorageType(inputs[0].dataType);
+
+    // Computation task assignment for k-split, should be assigned in block/atom unit
+    const computationTaskUnitInBBlock =
+      kSplitPattern === 'cachestep-interleaved' ? Math.max(scalarInputAPerSubgroupCache / blockSizeInScalarB, 1) : 1;
+    const computationTaskPerKSplitInBBlockWGSL = `(n_blocks_per_col + ${computationTaskUnitInBBlock} * KSplitFactor - 1) / (${computationTaskUnitInBBlock} * KSplitFactor) * ${computationTaskUnitInBBlock}`;
+
+    // Loop variables statements
+    var blockLoopInitialBlockStatementWGSL = (blockVarWGSL: string) => {
+      switch (kSplitPattern) {
+        case 'cachestep-interleaved': {
+          return `${blockVarWGSL} = k_split_id * ${computationTaskUnitInBBlock};`;
+        }
+        case 'block-interleaved': {
+          return `${blockVarWGSL} = k_split_id;`;
+        }
+        case 'continious': {
+          return `${blockVarWGSL} = k_split_id * blocks_per_k_split;`;
+        }
+      }
+    };
+    var blockLoopNextBlockStatementWGSL = (blockVarWGSL: string) => {
+      switch (kSplitPattern) {
+        case 'cachestep-interleaved': {
+          // if (${isMultipleWGSL(updatedBlockLoopVarWGSL, computationTaskUnitInBBlock)})
+          return `
+        if (${moduloWGSL(blockVarWGSL, computationTaskUnitInBBlock)} == ${computationTaskUnitInBBlock - 1}) {
+          ${blockVarWGSL} += ${(kSplitFactor - 1) * computationTaskUnitInBBlock + 1};
+        } else {
+          ${blockVarWGSL}++;
+        }`;
+        }
+        case 'block-interleaved': {
+          return `
+        ${blockVarWGSL} += ${kSplitFactor};`;
+        }
+        case 'continious': {
+          return `${blockVarWGSL}++;`;
+        }
+      }
+    };
+    // Subgroup cache statements and expression
+    var initialStartLoadingPointAStatementWGSL = (loadingPointASubgroupCacheStartColVarWGSL: string) => {
+      switch (kSplitPattern) {
+        case 'cachestep-interleaved': {
+          return `${loadingPointASubgroupCacheStartColVarWGSL} = k_split_id * ${computationTaskUnitInBBlock} * LoadingPointAPerBlockB;`;
+        }
+        case 'block-interleaved': {
+          return `${loadingPointASubgroupCacheStartColVarWGSL} = LoadingPointAPerBlockB * k_split_id;`;
+        }
+        case 'continious': {
+          return `${loadingPointASubgroupCacheStartColVarWGSL} = LoadingPointAPerBlockB * k_split_id * blocks_per_k_split;`;
+        }
+      }
+    };
+    var nextStartLoadingPointAStatementWGSL = (loadingPointASubgroupCacheStartColVarWGSL: string) => {
+      switch (kSplitPattern) {
+        case 'cachestep-interleaved': {
+          // In this pattern a cachestep contains at least one whole subgroup cache step
+          const loadingPointAStride = computationTaskUnitInBBlock * loadingPointAPerBlockB;
+          return `
+        // Check if next subgroup cache step is in new cachestep atom
+        if (${moduloWGSL(loadingPointASubgroupCacheStartColVarWGSL, loadingPointAStride)} == ${
+          loadingPointAStride - loadingPointAPerSubgroupCache
+        }) {
+          ${loadingPointASubgroupCacheStartColVarWGSL} += ${loadingPointAPerSubgroupCache} + ${(kSplitFactor - 1) * loadingPointAStride};
+        } else {
+          ${loadingPointASubgroupCacheStartColVarWGSL} += ${loadingPointAPerSubgroupCache};
+        }`;
+        }
+        case 'block-interleaved': {
+          if (scalarInputAPerSubgroupCache % blockSizeInScalarB === 0) {
+            // Multiple block within single subgroup cache step
+            return `${loadingPointASubgroupCacheStartColVarWGSL} += ${kSplitFactor * loadingPointAPerSubgroupCache};`;
+          } else {
+            // Multiple subgroup cache step within a single block
+            return `
+        // Check if next subgroup cache step is in new block
+        if (${moduloWGSL(loadingPointASubgroupCacheStartColVarWGSL, loadingPointAPerBlockB)} == ${
+          loadingPointAPerBlockB - loadingPointAPerSubgroupCache
+        }) {
+          ${loadingPointASubgroupCacheStartColVarWGSL} += ${loadingPointAPerSubgroupCache} + ${(kSplitFactor - 1) * loadingPointAPerBlockB};
+        } else {
+          ${loadingPointASubgroupCacheStartColVarWGSL} += ${loadingPointAPerSubgroupCache};
+        }
+        `;
+          }
+        }
+        case 'continious': {
+          return `${loadingPointASubgroupCacheStartColVarWGSL} += ${loadingPointAPerSubgroupCache};`;
+        }
+      }
+    };
+    const calcBiasedLoadingPointAForSubgroupCache = (
+      calcTargetValueWGSL: string,
+      loadingPointASubgroupCacheStartColVarWGSL: string,
+      subgroupCacheArrayIndexVarWGSL: string,
+      subgroupIdVarWGSL: string,
+    ) => {
+      const loadingPointABias = `(${subgroupCacheArrayIndexVarWGSL} * ${subgroupSize} + ${subgroupIdVarWGSL})`;
+      switch (kSplitPattern) {
+        case 'cachestep-interleaved': {
+          // In this pattern a cachestep contains at least one whole subgroup cache step, no block crossing
+          return `let ${calcTargetValueWGSL} = ${loadingPointASubgroupCacheStartColVarWGSL} + ${loadingPointABias};`;
+        }
+        case 'block-interleaved': {
+          if (scalarInputAPerSubgroupCache % blockSizeInScalarB === 0) {
+            // Multiple block within single subgroup cache step, might go across blocks
+            return `
+        let ${calcTargetValueWGSL}_bias = ${loadingPointABias};
+        let ${calcTargetValueWGSL}_bias_block_B = ${divideWGSL(`${calcTargetValueWGSL}_bias`, loadingPointAPerBlockB)};
+        let ${calcTargetValueWGSL} = ${
+          loadingPointASubgroupCacheStartColVarWGSL
+        } + ${calcTargetValueWGSL}_bias + ${calcTargetValueWGSL}_bias_block_B * ${
+          (kSplitFactor - 1) * loadingPointAPerBlockB
+        };`;
+          } else {
+            // Multiple subgroup cache step within a single block, won't go across blocks within a subgroup cache step
+            return `let ${calcTargetValueWGSL} = ${loadingPointASubgroupCacheStartColVarWGSL} + ${loadingPointABias};`;
+          }
+        }
+        case 'continious': {
+          return `let ${calcTargetValueWGSL} = ${loadingPointASubgroupCacheStartColVarWGSL} + ${loadingPointABias};`;
+        }
+      }
+    };
+
+    return `
+const LoadingPointAPerBlockB = ${loadingPointAPerBlockB}u;
+const LoadingPointAPerSubgroupCache = ${loadingPointAPerSubgroupCache}u;
+const KSplitFactor = ${kSplitFactor}u;
+
+var<workgroup> inter_results: array<array<${output.type.value}, ${kSplitFactor}>, ${subgroupSize}>;
+
+${shaderHelper.declareVariables(...inputVariables, output)}
+
+@compute @workgroup_size(${workgroupSize}, 1, 1)
+fn main(
+  @builtin(global_invocation_id) global_id : vec3<u32>,
+  @builtin(workgroup_id) workgroup_id : vec3<u32>,
+  @builtin(local_invocation_index) local_idx : u32,
+  @builtin(local_invocation_id) local_id : vec3<u32>,
+  @builtin(subgroup_size) sg_size : u32,
+  @builtin(subgroup_invocation_id) subgroup_id : u32,
+) {
+  let global_idx = global_id.x;
+  let workgroup_index = workgroup_id.x;
+
+  // Assert subgroup_size == ${subgroupSize}
+  if (sg_size != ${subgroupSize}) {
+    return;
+  }
+
+  // Expect subgroup_size == ${subgroupSize}
+  let k_split_id = local_idx / sg_size;
+
+  // Indices of the first output of the workgroup
+  let output_indices = ${output.offsetToIndices(`workgroup_index * ${subgroupSize}`)};
+  let output_col_workgroup_base = output_indices[2];
+  let output_row_workgroup_base = output_indices[1];
+  let batch = output_indices[0];
+  let n_blocks_per_col = uniforms.b_shape[1];
+
+  let input_b_col = output_col_workgroup_base + subgroup_id;
+
+  // K-split assigned B blocks per thread
+  let blocks_per_k_split = ${computationTaskPerKSplitInBBlockWGSL};
+
+  var subgroup_cached_loading_points_A: array<${a.type.value}, ${loadingPointAPerSubgroupThread}>;
+
+  ${!accInSharedMemory ? `var acc: ${output.type.value};` : ''}
+
+  var block: u32;
+  var scale: ${scales.type.value};
+  ${
+    zeroPoints
+      ? `var zero_point: ${dataType};`
+      : `// The default zero point is 8 for unsigned 4-bit quantization.
+  let zero_point = ${dataType}(${8.0});`
+  }
+  var loading_point_b: ${b.type.value};
+  var b_dequantized_values: mat2x4<${dataType}>;
+
+  // Loop through blocks, k-split pattern: ${kSplitPattern}
+  ${blockLoopInitialBlockStatementWGSL('block')}
+  var loading_point_A_subgroup_cache_start_col: u32;
+  var loading_point_A_within_subgroup_cache = 0u;
+  ${initialStartLoadingPointAStatementWGSL('loading_point_A_subgroup_cache_start_col')}
+  for (var loop_block_step: u32 = 0; loop_block_step < blocks_per_k_split; loop_block_step++) {
+    // Load new B block
+    {
+    ${
+      zeroPoints
+        ? `
+      // Load zero-point for current block
+      let zero_point_bytes_per_col = (n_blocks_per_col + 1) / 2;
+      let zero_point_byte_count = input_b_col * zero_point_bytes_per_col + (block >> 0x1u);
+      let zero_point_word_index = zero_point_byte_count >> 0x2u;
+      let zero_point_byte_offset = zero_point_byte_count & 0x3u;
+      let zero_point_nibble_offset: u32 = block & 0x1u;
+      let zero_point_bits_offset = (zero_point_byte_offset << 3) + (zero_point_nibble_offset << 2);
+      let zero_point_word = ${zeroPoints.getByOffset('zero_point_word_index')} >> zero_point_bits_offset;
+      zero_point = ${dataType}((zero_point_word) & 0xFu);`
+        : `
+      // The zero point is by default 8 for unsigned 4-bit quantization.`
+    }
+      scale = ${scales.getByOffset(`input_b_col * n_blocks_per_col + block`)};
+    }
+
+    // Loop through A loading point
+    for (
+      var loading_point_A_within_block_B: u32 = 0;
+      loading_point_A_within_block_B < LoadingPointAPerBlockB;
+      loading_point_A_within_block_B++
+    ) {
+      // if (NEED_NEW_SUBGROUP_CACHE_A)
+      if (${isMultipleWGSL('loading_point_A_within_subgroup_cache', loadingPointAPerSubgroupCache)}) {
+        for (var subgroup_cache_idx: u32 = 0; subgroup_cache_idx < ${loadingPointAPerSubgroupThread}; subgroup_cache_idx++) {
+          // Bias = idx * subgroupSize + subgroupId
+          ${calcBiasedLoadingPointAForSubgroupCache('loading_point_A_col', 'loading_point_A_subgroup_cache_start_col', 'subgroup_cache_idx', 'subgroup_id')}
+          if (loading_point_A_col < ${a.shape}[2]) {
+            subgroup_cached_loading_points_A[subgroup_cache_idx] = ${a.getByIndices(`${a.type.indices}(batch, output_row_workgroup_base, loading_point_A_col)`)};
+          } else {
+            subgroup_cached_loading_points_A[subgroup_cache_idx] = ${a.type.value}();
+          }
+        }
+        // Update A position
+        ${nextStartLoadingPointAStatementWGSL('loading_point_A_subgroup_cache_start_col')}
+        loading_point_A_within_subgroup_cache = 0;
+      }
+
+      // if (NEED_NEW_LOADING_POINT_B)
+      if (${isMultipleWGSL('loading_point_A_within_block_B', 32 /* 4U32 = 32U4 */ / aComponents)}) {
+        // Load new B loading point
+        loading_point_b = ${b.getByIndices(
+          `${b.type.indices}(input_b_col, block, ${divideWGSL('loading_point_A_within_block_B', scalarsPerLoadingPointB / aComponents)})`,
+        )};
+      }
+      // if (NEED_DEQUANTIZE_NEW_INPUT_B)
+      if (${isMultipleWGSL('loading_point_A_within_block_B', 8 /* U32 = 8U4 */ / aComponents)}) {
+        // let bComponent = ((loading_point_A_within_block_B * aComponents) / 8 /* U32 = 8U4 */) % bComponents;
+        let bComponent = ${moduloWGSL(divideWGSL('loading_point_A_within_block_B', 8 /* U32 = 8U4 */ / aComponents), bComponents)};
+        // Dequantize new component of B
+        let b_value = loading_point_b[bComponent];
+        let b_value_lower = unpack4xU8(b_value & 0x0F0F0F0Fu);
+        let b_value_upper = unpack4xU8((b_value >> 4) & 0x0F0F0F0Fu);
+        let b_quantized_values = mat2x4<${dataType}>(${Array.from(
+          { length: 4 },
+          (_, i) => `${dataType}(b_value_lower[${i}]), ${dataType}(b_value_upper[${i}])`,
+        ).join(', ')});
+        b_dequantized_values = (b_quantized_values - mat2x4<${dataType}>(${Array(8).fill('zero_point').join(',')})) * scale;
+      }
+
+      // Compute dot-prod for one loading point A
+      ${accInSharedMemory ? 'inter_results[subgroup_id][k_split_id]' : 'acc'} += ${
+        // Expression computing a single loading point A
+        (() => {
+          switch (aComponents) {
+            case 4: {
+              return `dot(
+        subgroupShuffle(
+          subgroup_cached_loading_points_A[${divideWGSL('loading_point_A_within_subgroup_cache', subgroupSize)}],
+          ${moduloWGSL('loading_point_A_within_subgroup_cache', subgroupSize)}
+        ),
+        b_dequantized_values[${moduloWGSL('loading_point_A_within_subgroup_cache', 2)}]
+      )`;
+            }
+            case 2: {
+              return `dot(
+              subgroupShuffle(
+                subgroup_cached_loading_points_A[${divideWGSL('loading_point_A_within_subgroup_cache', subgroupSize)}],
+                ${moduloWGSL('loading_point_A_within_subgroup_cache', subgroupSize)}
+              ),
+              select(
+                b_dequantized_values[${moduloWGSL(divideWGSL('loading_point_A_within_subgroup_cache', 2), 2)}].zw,
+                b_dequantized_values[${moduloWGSL(divideWGSL('loading_point_A_within_subgroup_cache', 2), 2)}].xy,
+                ${moduloWGSL('loading_point_A_within_subgroup_cache', 2)} == 0
+              )
+            )`;
+            }
+            case 1: {
+              return `subgroupShuffle(
+                subgroup_cached_loading_points_A[${divideWGSL('loading_point_A_within_subgroup_cache', subgroupSize)}],
+                ${moduloWGSL('loading_point_A_within_subgroup_cache', subgroupSize)}
+              ) *
+              b_dequantized_values[${moduloWGSL(divideWGSL('loading_point_A_within_subgroup_cache', 4), 2)}][${moduloWGSL('loading_point_A_within_subgroup_cache', 4)}]
+            )`;
+            }
+          }
+        })()
+      };
+
+      loading_point_A_within_subgroup_cache++;
+    } // End of loading point A loop within block B
+
+    ${blockLoopNextBlockStatementWGSL('block')}
+  } // End of block B loop
+
+  ${!accInSharedMemory ? 'inter_results[subgroup_id][k_split_id] = acc;' : ''}
+  workgroupBarrier();
+
+  if (local_idx < ${subgroupSize}) {
+    var output_value: ${output.type.value} = ${output.type.value}(0);
+    ${Array.from({ length: kSplitFactor })
+      .map(
+        (_, kSplit) => `
+    output_value += inter_results[subgroup_id][${kSplit}];`,
+      )
+      .join('')}
+    if (output_col_workgroup_base + local_idx < uniforms.output_shape[2])
+    {
+      ${output.setByIndices(`${output.type.indices}(batch, output_row_workgroup_base, output_col_workgroup_base + local_idx)`, 'output_value')}
+    }
+  }
+}`;
+  };
+  return {
+    name: 'BlockwiseMatMulNBitsSubgroupsShuffle32N-1',
+    shaderCache: {
+      hint: `${attributes.blockSize};${aComponents};${bComponents};${Object.entries(shaderParams)
+        .map((entry) => `${entry[0]}:${entry[1]}`)
+        .join(';')}`,
       inputDependencies: Array(inputs.length).fill('rank'),
     },
     getRunData: () => ({
@@ -826,9 +1352,18 @@ export const matMulNBits = (context: ComputeContext, attributes: MatMulNBitsAttr
     context.compute(
       createMatMulNBitsSubgroupsBlockSize32NProgramInfo(context.inputs, attributes, {
         subgroupSize: 16,
-        kSplitFactor: 8,
+        kSplitFactor: 4,
       }),
     );
+    // context.compute(
+    //   createMatMulNBitsSubgroupsShuffleBlockSize32NProgramInfo(context.inputs, attributes, {
+    //     subgroupSize: 32,
+    //     kSplitFactor: 4,
+    //     kSplitPattern: 'block-interleaved' as 'cachestep-interleaved' | 'block-interleaved' | 'continious',
+    //     vec4InputAPerSubgroupThread: 1,
+    //     accInSharedMemory: false,
+    //   }),
+    // );
     // context.compute(createMatMulNBitsBlockSize32ProgramInfo(context.inputs, attributes));
     // context.compute(createMatMulNBitsProgramInfo(context.inputs, attributes));
   } else {
