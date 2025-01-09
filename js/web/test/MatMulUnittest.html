@@ -1,0 +1,215 @@
+<html>
+
+<head>
+    <title>MatMul Unittest</title>
+
+    <link rel="stylesheet" href="sortable.min.css" />
+    <link rel="stylesheet" href="profilingDisplayer.css" />
+
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css" rel="stylesheet"
+        integrity="sha384-4bw+/aepP/YC94hEpVNVgiZdgIC5+VKNBQNGCHeKRQN+PtmoHDEXuppvnDJzQIu9" crossorigin="anonymous" />
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/js/bootstrap.bundle.min.js"
+        integrity="sha384-HwwvtgBNo3bZJJLYd8oVXjrBZt8cqVSpeBNS5n7C8IVInixGAoxmnlMuBnhbgrkm"
+        crossorigin="anonymous"> </script>
+</head>
+
+<script src="https://cdn.jsdelivr.net/npm/protobufjs@7.4.0/dist/protobuf.js"></script>
+
+<script src="sortable.min.js"></script>
+<script src="profilingDisplayer.js"></script>
+
+<script src="util.js"></script>
+
+<script type="module">
+    "use scrict";
+
+    await loadOrt();
+
+    function logToConsoleAndPage(i) { console.log(i); document.getElementById('status').innerText += `\n${i}`; }
+    function clearStatusLog(i) { document.getElementById('status').innerText = ''; }
+
+    function getConfig() {
+        const query = window.location.search.substring(1);
+        var config = {
+            ortUrl: "default",
+
+            repeatTime: 3,
+            testShapes: "f32-1x77x4096-4096x1024,f16-1x77x4096-4096x1024"
+        };
+
+        let vars = query.split("&");
+        for (var i = 0; i < vars.length; i++) {
+            let pair = vars[i].split("=");
+            const key = pair[0];
+            const value = decodeURIComponent(pair[1]);
+            if (key in config) {
+                if (typeof config[key] == "number") {
+                    config[key] = parseInt(value);
+                }
+                else {
+                    config[key] = value;
+                }
+            } else if (key.length > 0) {
+                // throw new Error("unknown argument: " + pair[0]);
+                logToConsoleAndPage(`unknown argument: ${key}${value ? `=${value}` : ''}`);
+            }
+        }
+
+        config.testShapes = config.testShapes.split(',').map(shapeStr => {
+            const [dataTypeStr, dimsAStr, dimsBStr] = shapeStr.split('-');
+            console.assert(['f16', 'f32'].includes(dataTypeStr), `Expect data type f16 or f32 in ${shapeStr}, got ${dataTypeStr}`);
+            const dataType = dataTypeStr === 'f16' ? 'float16' : 'float32';
+            const dimsStrToDims = (dimsStr) => dimsStr.split('x').map(xStr => Number(xStr));
+            const dimsA = dimsStrToDims(dimsAStr);
+            const dimsB = dimsStrToDims(dimsBStr);
+            return { dataType, dimsA, dimsB };
+        });
+
+        return config;
+    }
+
+    const config = getConfig();
+
+    // Hook the protobuf.js path resolver to enable loading proto files from other origin
+    window.protobuf.Root.prototype.resolvePath = (a, b) => a + b;
+    // Load proto from Onnx to enable building Onnx model
+    const onnxPbRoot = await window.protobuf.load("https://raw.githubusercontent.com/onnx/onnx/refs/heads/main/onnx/onnx.proto3");
+    const Model = onnxPbRoot.lookupType('ModelProto');
+
+    const buildMatMulOnnxModel = (dtype, shapeA, shapeB) => {
+        const onnxFloat32Type = 1;
+        const onnxFloat16Type = 10;
+        const typeValue = dtype === 'float16' ? onnxFloat16Type : onnxFloat32Type;
+
+        // Handle broadcast shape
+        const outputDim = Math.max(shapeA.length, shapeB.length);
+        const expandedShapeA = [...Array.from({ length: outputDim - shapeA.length }).map(() => 1), ...shapeA];
+        const expandedShapeB = [...Array.from({ length: outputDim - shapeB.length }).map(() => 1), ...shapeB];
+        const shapeOutput = Array.from({ length: outputDim }).map((_, i) => Math.max(expandedShapeA[i], expandedShapeB[i]));
+        shapeOutput[outputDim - 2] = expandedShapeA[outputDim - 2];
+        shapeOutput[outputDim - 1] = expandedShapeB[outputDim - 1];
+
+        const model = {
+            "irVersion": 10,
+            "opsetImport": [{ "domain": "", "version": "19" }],
+            "graph": {
+                "node": [
+                    {
+                        "name": "MatMul_0",
+                        "input": ["A", "B"],
+                        "output": ["Y"],
+                        "opType": "MatMul",
+                        "domain": ""
+                    }
+                ],
+                "name": "MM",
+                "input": [
+                    {
+                        "name": "A",
+                        "type": {
+                            "tensorType": {
+                                "elemType": typeValue,
+                                "shape": {
+                                    "dim": shapeA.map(dimValue => ({ dimValue })),
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "name": "B",
+                        "type": {
+                            "tensorType": {
+                                "elemType": typeValue,
+                                "shape": {
+                                    "dim": shapeB.map(dimValue => ({ dimValue })),
+                                }
+                            }
+                        }
+                    }
+                ],
+                "output": [
+                    {
+                        "name": "Y",
+                        "type": {
+                            "tensorType": {
+                                "elemType": typeValue,
+                                "shape": {
+                                    "dim": shapeOutput.map(dimValue => ({ dimValue })),
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+        };
+
+        const modelPb = Model.fromObject(model);
+        return Model.encode(modelPb).finish();
+    };
+
+    const runAndProfile = async (dataType, dimsA, dimsB, repeatTime = 3) => {
+        let model = buildMatMulOnnxModel(dataType, dimsA, dimsB)
+
+        const opt = {
+            executionProviders: ["webgpu"],
+            enableMemPattern: false,
+            enableCpuMemArena: false,
+            extra: {
+                session: {
+                    disable_prepacking: "1",
+                    use_device_allocator_for_initializers: "1",
+                    use_ort_model_bytes_directly: "1",
+                    use_ort_model_bytes_for_initializers: "1"
+                }
+            },
+            preferredOutputLocation: { last_hidden_state: "gpu-buffer" },
+        };
+        let session = await ort.InferenceSession.create(model, opt);
+        let device = ort.env.webgpu.device;
+
+        const elementByteSize = dataType === 'float16' ? 2 : 4;
+        const requiredInputByteSize = (dims) => dims.reduce((a, b) => a * b, 1) * elementByteSize;
+
+        const align = (x, alignment) => Math.ceil(x / alignment) * alignment;
+        let bufferA = device.createBuffer({ size: align(requiredInputByteSize(dimsA), 16), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        let bufferB = device.createBuffer({ size: align(requiredInputByteSize(dimsB), 16), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+
+        let tensorA = ort.Tensor.fromGpuBuffer(bufferA, { dataType, dims: dimsA, dispose: () => bufferA.destroy() })
+        let tensorB = ort.Tensor.fromGpuBuffer(bufferB, { dataType, dims: dimsB, dispose: () => bufferB.destroy() })
+
+        // ort.env.webgpu.profiling = { mode: 'default' };
+        enableWebGPUProfiling(ort);
+        for (let i = 0; i < repeatTime; i++) {
+            let r = await session.run({ "A": tensorA, "B": tensorB });
+        }
+    }
+
+    let { webgpuProfilingData } = hookConsoleLogForProfilingDisplay(console);
+
+    for (let testShape of config.testShapes) {
+        await runAndProfile(testShape.dataType, testShape.dimsA, testShape.dimsB, config.repeatTime);
+    }
+
+    // Handle the profiling log and generate the data tables
+    const aggregatedTable = generateAggregatedProfilingTable(["Kernel", "Time (ms)", "Percentage (%)"], webgpuProfilingData);
+    const dataTable = generateDataTable(["Index", "Kernel", "Time (ms)", "Shape"], webgpuProfilingData);
+    // Make profiling results panel visible
+    enableProfilingResultsPanel();
+    // Display the data tables in the panel
+    addDataTable(aggregatedTable, 'Aggregated time');
+    addDataTable(dataTable, 'Detailed time');
+
+</script>
+
+
+<body data-bs-theme="dark">
+    <div class="profilingResultsPanelWrapper"
+        style="width:80%; margin-left: auto; margin-right: auto; background-color: blanchedalmond;">
+        <div id="profilingResultsPanel"></div>
+    </div>
+    <div id="statusWrapper">
+        <pre id="status"></pre>
+    </div>
+</body>
+
+</html>
